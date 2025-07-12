@@ -1,7 +1,20 @@
 @prefix lv2:  <http://lv2plug.in/ns/lv2core#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ui:   <http://lv2plug.in/ns/extensions/ui#> .
 
-<http://gregorioferraris.github.io/lv2/gla2a>
+# Definisci il plugin GLA2A
+<http://moddevices.com/plugins/mod-devel/gla2a>
     a lv2:Plugin ;
-    lv2:binary <gla2a.so> ; # Il file binario del plugin che creeremo
-    rdfs:seeAlso <gla2a.ttl> . # Il descrittore dettagliato del plugin
+    rdfs:seeAlso <gla2a.ttl> ;    # Il file TTL che descrive le porte e le proprietà del plugin core
+    rdfs:seeAlso <gla2a.so> ;     # La libreria compilata del plugin core
+    ui:optionalGui <http://moddevices.com/plugins/mod-devel/gla2a_ui> . # Collega alla GUI
+
+# Definisci l'interfaccia utente (GUI) di GLA2A
+<http://moddevices.com/plugins/mod-devel/gla2a_ui>
+    a ui:X11UI ;                  # Tipo di interfaccia utente (X11 è comune per GUI native su Linux)
+    ui:binary <gla2a_ui.so> ;     # La libreria compilata della GUI
+    lv2:requiredFeature <http://lv2plug.in/ns/ext/options#options> ; # Opzionale, ma buona pratica per le GUI moderne
+    lv2:requiredFeature <http://lv2plug.in/ns/ext/urid#map> ;     # Richiesto per mappare URI a URID (necessario per ImGui)
+    lv2:requiredFeature <http://lv2plug.in/ns/ext/ui#idle> ;      # Richiesto per le GUI che necessitano di aggiornamenti in background (come ImGui)
+    lv2:extensionData <http://lv2plug.in/ns/ext/ui#noUserResize> ; # Impedisce all'host di ridimensionare la finestra, lasciando a ImGui il controllo
+    rdfs:seeAlso <gla2a.ttl> .    # Riferimento al TTL del plugin per le definizioni delle porte che la GUI controllerà
