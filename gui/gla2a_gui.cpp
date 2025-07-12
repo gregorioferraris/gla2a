@@ -1,1089 +1,875 @@
 #include <lv2/ui/ui.h>
 #include <lv2/atom/atom.h>
-#include <lv2/atom/atom-forge.h>
+#include <lv2/atom/util.h>
 #include <lv2/urid/urid.h>
 #include <lv2/core/lv2.h>
-#include <lv2/ui/parent.h>
+#include <lv2/log/log.h>
+#include <lv2/log/logger.h>
 
-#include <wx/wx.h>
-#include <wx/frame.h>
-#include <wx/panel.h>
-#include <wx/sizer.h>
-#include <wx/stattext.h>
-#include <wx/button.h>
-#include <wx/notebook.h>
-#include <wx/dcbuffer.h>
-#include <wx/graphics.h>
-#include <wx/timer.h> // Per animare la valvola
-#include <algorithm>
-#include <stdio.h>
-#include <string.h>
-#include <vector>
-#include <cmath>
+// --- DIPENDENZE IMGUI ---
+#include "imgui.h"
+#include "backends/imgui_impl_opengl3.h"
+#include <cmath>     // Per funzioni matematiche come atan2, sin, cos
+#include <chrono>    // Per la gestione del tempo in C++11
+#include <vector>    // Per std::vector
+#include <string>    // Per std::string
+#include <iostream>  // Per cout/cerr (debug)
 
-// URI unico della tua GUI (deve corrispondere a quello nel TTL)
-#define GLA2A_GUI_URI "http://gregorioferraris.github.io/lv2/gla2a#x11gui"
+// --- DIPENDENZE STB_IMAGE (per caricare immagini) ---
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h" // Assicurati che questo header sia nel tuo INCLUDE path
 
-// Definizione degli indici delle porte (DEVE essere identica al tuo gla2a.cpp e gla2a.ttl)
-typedef enum {
-    GLA2A_CONTROL_GAIN_IN           = 0,
-    GLA2A_CONTROL_GAIN_OUT          = 1,
-    GLA2A_CONTROL_THRESHOLD         = 2, // Rinominato da PEAK_REDUCTION
-    GLA2A_CONTROL_MODE              = 3, // Questo non sarà più usato direttamente se integrato in Ratio
-    GLA2A_CONTROL_SIDECHAIN_MODE    = 4,
-    GLA2A_AUDIO_EXTERNAL_SIDECHAIN_IN = 5,
-    GLA2A_CONTROL_RATIO_SELECT      = 6,
-    GLA2A_CONTROL_AR_PRESET         = 7,
-    GLA2A_CONTROL_TUBE_DRIVE        = 8,
-    GLA2A_AUDIO_IN_L                = 9,
-    GLA2A_AUDIO_IN_R                = 10,
-    GLA2A_AUDIO_OUT_L               = 11,
-    GLA2A_AUDIO_OUT_R               = 12,
-    GLA2A_CONTROL_OVERSAMPLING_MODE = 13,
-    GLA2A_CONTROL_SIDECHAIN_HPF_FREQ = 14,
-    GLA2A_CONTROL_SIDECHAIN_LPF_FREQ = 15,
-    GLA2A_CONTROL_SIDECHAIN_HPF_Q   = 16,
-    GLA2A_CONTROL_SIDECHAIN_LPF_Q   = 17,
-    GLA2A_CONTROL_SIDECHAIN_MONITOR_MODE = 18,
-    GLA2A_CONTROL_INPUT_ATTENUATOR  = 19,
-    GLA2A_CONTROL_GAIN_REDUCTION    = 20, // Nuova manopola Gain Reduction
-    GLA2A_PEAK_OUT_L                = 21, // Per i VU meter
-    GLA2A_PEAK_IN_L                 = 22, // Per il VU meter I/O
-    GLA2A_PEAK_GR                   = 23  // Per il VU meter GR
-} PortIndex;
+// --- DIPENDENZE PER IL CONTESTO OPENGL (Linux/X11) ---
+#include <GL/gl.h>
+#include <GL/glx.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>   // Per XGetWindowAttributes
+#include <X11/keysym.h>  // Per la gestione della tastiera (sebbene l'inoltro eventi sia un punto critico)
+
+// --- URID e LOGGING (definizione esterna, come nel tuo codice LV2) ---
+LV2_LOG_Logger logger;
+LV2_URID_Map urid_map;
+LV2_URID_Unmap urid_unmap;
+
+// =========================================================================
+// URI dei Parametri (Devono corrispondere esattamente al tuo plugin audio)
+// =========================================================================
+// URI per i parametri del tuo compressore
+static LV2_URID peakReduction_URID;
+static LV2_URID gain_URID;
+static LV2_URID bypass_URID;
+static LV2_URID ratioMode_URID;
+static LV2_URID valveDrive_URID;
+static LV2_URID inputPad10dB_URID;
+static LV2_URID oversamplingOn_URID;
+static LV2_URID sidechainMode_URID;
+static LV2_URID scLpOn_URID;
+static LV2_URID scLpFq_URID;
+static LV2_URID scLpQ_URID;
+static LV2_URID scHpOn_URID;
+static LV2_URID scHpFq_URID;
+static LV2_URID scHpQ_URID;
+
+// URI per i valori dei meter (che il plugin audio invierà alla GUI)
+static LV2_URID peakGR_URID;
+static LV2_URID peakInL_URID;
+static LV2_URID peakInR_URID;
+static LV2_URID peakOutL_URID;
+static LV2_URID peakOutR_URID;
 
 
-// Colori della GUI
-const wxColour LA2A_BEIGE_COLOR(230, 210, 180);
-const wxColour LA2A_ORANGE_VUMETER_COLOR(255, 165, 0);
-const wxColour LA2A_VALVE_OFF_COLOR(50, 0, 0);
-const wxColour LA2A_VALVE_ON_COLOR(255, 100, 0); // Bagliore arancione/rosso
+// =========================================================================
+// Funzioni Helper per ImGui
+// =========================================================================
 
-// --- CLASSE CUSTOM PER MANOPOLE (Knob) ---
-class CustomKnob : public wxControl {
-public:
-    CustomKnob(wxWindow* parent, wxWindowID id, float min_val, float max_val, float default_val,
-               const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize, long style = 0)
-        : wxControl(parent, id, pos, size, style),
-          minValue(min_val), maxValue(max_val), currentValue(default_val) {
-        SetBackgroundStyle(wxBG_STYLE_PAINT);
-        SetBackgroundColour(parent->GetBackgroundColour()); // Usa lo sfondo del pannello padre
+// Implementazione della funzione di gestione del tempo per ImGui
+static double get_time_in_seconds() {
+    static auto start_time = std::chrono::high_resolution_clock::now();
+    auto current_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = current_time - start_time;
+    return elapsed.count();
+}
 
-        Bind(wxEVT_PAINT, &CustomKnob::OnPaint, this);
-        Bind(wxEVT_LEFT_DOWN, &CustomKnob::OnMouseLeftDown, this);
-        Bind(wxEVT_MOTION, &CustomKnob::OnMouseMove, this);
-        Bind(wxEVT_LEFT_UP, &CustomKnob::OnMouseLeftUp, this);
+// Helper function per caricare texture con stb_image
+GLuint LoadTextureFromFile(const char* filename, int* out_width, int* out_height)
+{
+    int image_width = 0;
+    int image_height = 0;
+    unsigned char* image_data = stbi_load(filename, &image_width, &image_height, NULL, 4);
+    if (image_data == NULL) {
+        lv2_log_error(&logger, "Error: Could not load texture from file: %s\n", filename);
+        return 0;
     }
 
-    void SetValue(float val) {
-        if (val < minValue) val = minValue;
-        if (val > maxValue) val = maxValue;
-        if (currentValue != val) {
-            currentValue = val;
-            Refresh();
+    GLuint image_texture;
+    glGenTextures(1, &image_texture);
+    glBindTexture(GL_TEXTURE_2D, image_texture);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image_width, image_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image_data);
+
+    stbi_image_free(image_data);
+
+    *out_width = image_width;
+    *out_height = image_height;
+
+    return image_texture;
+}
+
+// Funzione helper per creare un knob rotativo basato su immagine
+// Ritorna true se il valore è stato modificato
+bool KnobRotaryImage(const char* label, float* p_value, float v_min, float v_max,
+                     GLuint texture_id, int frame_width, int frame_height, int total_frames,
+                     ImVec2 knob_size_pixels, const char* format = "%.2f")
+{
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems)
+        return false;
+
+    ImGuiContext& g = *GImGui;
+    const ImGuiStyle& style = g.Style;
+    const ImGuiID id = window->GetID(label);
+
+    ImVec2 pos = window->DC.CursorPos;
+    ImRect bb(pos, ImVec2(pos.x + knob_size_pixels.x, pos.y + knob_size_pixels.y + ImGui::GetTextLineHeightWithSpacing()));
+
+    ImGui::ItemSize(bb); // Riserva spazio per il knob e il label
+    if (!ImGui::ItemAdd(bb, id))
+        return false;
+
+    const bool hovered = ImGui::ItemHoverable(bb, id);
+    // Controllo se il mouse è cliccato o trascinato sull'elemento
+    bool value_changed = false;
+    bool held = ImGui::IsItemActive(); // L'elemento è attivo (cliccato e trascinato)
+
+    // Gestione dell'input (trascinamento verticale)
+    if (hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        // Se il knob non era già attivo, rendilo attivo (per la logica di ImGui)
+        if (!held) ImGui::SetActiveID(id, window);
+    }
+
+    if (held) {
+        float delta_y = ImGui::GetIO().MouseDelta.y;
+        float speed = (v_max - v_min) / (knob_size_pixels.y * 2.0f); // Sensibilità basata sull'altezza del knob
+        *p_value -= delta_y * speed;
+        // Clampa il valore
+        *p_value = ImClamp(*p_value, v_min, v_max);
+        value_changed = true;
+
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            ImGui::ClearActiveID(); // Rilascia il controllo
         }
     }
-
-    float GetValue() const { return currentValue; }
-
-    void SetLabels(const std::vector<wxString>& labels) {
-        discreteLabels = labels;
-        Refresh();
+    // Gestione rotella del mouse
+    if (hovered && io.MouseWheel != 0.0f) {
+        float wheel_speed = (v_max - v_min) / 50.0f; // Sensibilità rotella
+        *p_value += io.MouseWheel * wheel_speed;
+        *p_value = ImClamp(*p_value, v_min, v_max);
+        value_changed = true;
     }
 
-private:
-    float minValue;
-    float maxValue;
-    float currentValue;
-    bool isDragging = false;
-    wxPoint lastDragPos;
-    std::vector<wxString> discreteLabels;
 
-    void OnPaint(wxPaintEvent& event) {
-        wxAutoBufferedPaintDC dc(this);
-        dc.SetBackground(wxBrush(GetBackgroundColour()));
-        dc.Clear();
+    // Calcola il frame da disegnare
+    float normalized_value = (*p_value - v_min) / (v_max - v_min);
+    int frame_index = static_cast<int>(normalized_value * (total_frames - 1));
+    frame_index = ImClamp(frame_index, 0, total_frames - 1); // Clampa l'indice del frame
 
-        wxSize clientSize = GetClientSize();
-        int cx = clientSize.GetWidth() / 2;
-        int cy = clientSize.GetHeight() / 2;
-        int radius = std::min(cx, cy) - 5;
+    // Calcola le coordinate UV per lo sprite sheet (assumendo i frame siano in una colonna)
+    ImVec2 uv0 = ImVec2(0.0f, (float)frame_index / total_frames);
+    ImVec2 uv1 = ImVec2(1.0f, (float)(frame_index + 1) / total_frames);
 
-        dc.SetBrush(wxBrush(wxColour(50, 50, 50)));
-        dc.SetPen(wxPen(wxColour(30, 30, 30), 1));
-        dc.DrawCircle(cx, cy, radius);
+    // Disegna l'immagine del knob
+    ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)texture_id,
+                                         bb.Min, ImVec2(bb.Min.x + knob_size_pixels.x, bb.Min.y + knob_size_pixels.y),
+                                         uv0, uv1);
 
-        float normalizedValue = (currentValue - minValue) / (maxValue - minValue);
-        float startAngle = M_PI * 1.75f; // -135 gradi (a ore 7:30)
-        float endAngle = M_PI * 0.25f; // 135 gradi (a ore 4:30)
-        float angleRange = endAngle - startAngle;
-        if (angleRange < 0) angleRange += M_PI * 2.0f;
+    // Disegna il label sotto il knob (centrato)
+    ImGui::SetCursorScreenPos(ImVec2(bb.Min.x, bb.Min.y + knob_size_pixels.y + style.ItemInnerSpacing.y));
+    ImGui::Text(label);
 
-        float currentAngle = startAngle + (normalizedValue * angleRange);
+    // Disegna il valore corrente sotto il label (se specificato)
+    char value_buf[64];
+    ImFormatString(value_buf, IM_ARRAYSIZE(value_buf), format, *p_value);
+    ImGui::SetCursorScreenPos(ImVec2(bb.Min.x, bb.Min.y + knob_size_pixels.y + style.ItemInnerSpacing.y + ImGui::GetTextLineHeight()));
+    ImGui::Text(value_buf);
 
-        dc.SetPen(wxPen(*wxWHITE, 2));
-        dc.DrawLine(cx + radius * 0.2 * cos(currentAngle),
-                    cy + radius * 0.2 * sin(currentAngle),
-                    cx + radius * 0.8 * cos(currentAngle),
-                    cy + radius * 0.8 * sin(currentAngle));
-
-        if (!discreteLabels.empty()) {
-            dc.SetPen(wxPen(*wxLIGHT_GREY, 1));
-            for (size_t i = 0; i < discreteLabels.size(); ++i) {
-                float discreteNormalizedValue = (float)i / (discreteLabels.size() - 1);
-                float discreteAngle = startAngle + (discreteNormalizedValue * angleRange);
-                dc.DrawLine(cx + radius * 0.85 * cos(discreteAngle),
-                            cy + radius * 0.85 * sin(discreteAngle),
-                            cx + radius * 0.95 * cos(discreteAngle),
-                            cy + radius * 0.95 * sin(discreteAngle));
-            }
-        }
-    }
-
-    void OnMouseLeftDown(wxMouseEvent& event) {
-        isDragging = true;
-        lastDragPos = event.GetPosition();
-        CaptureMouse();
-    }
-
-    void OnMouseMove(wxMouseEvent& event) {
-        if (isDragging && event.Dragging()) {
-            wxPoint currentPos = event.GetPosition();
-            int deltaY = lastDragPos.y - currentPos.y;
-            float sensitivity = (maxValue - minValue) / (GetClientSize().GetHeight() * 1.5f);
-            currentValue += deltaY * sensitivity;
-
-            SetValue(currentValue);
-
-            lastDragPos = currentPos;
-
-            wxCommandEvent evt(wxEVT_SLIDER, GetId());
-            evt.SetEventObject(this);
-            evt.SetDouble(currentValue);
-            GetParent()->ProcessWindowEvent(evt);
-        }
-    }
-
-    void OnMouseLeftUp(wxMouseEvent& event) {
-        isDragging = false;
-        if (HasCapture()) ReleaseMouse();
-    }
-};
-
-// --- CLASSE CUSTOM PER VU METER ---
-class CustomVUMeter : public wxControl {
-public:
-    CustomVUMeter(wxWindow* parent, wxWindowID id, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize, long style = 0)
-        : wxControl(parent, id, pos, size, style), meterValue(0.0f) {
-        SetBackgroundStyle(wxBG_STYLE_PAINT);
-        SetBackgroundColour(parent->GetBackgroundColour());
-        Bind(wxEVT_PAINT, &CustomVUMeter::OnPaint, this);
-    }
-
-    void SetMeterValue(float val) {
-        if (meterValue != val) {
-            meterValue = val;
-            Refresh();
-        }
-    }
-
-private:
-    float meterValue;
-
-    void OnPaint(wxPaintEvent& event) {
-        wxAutoBufferedPaintDC dc(this);
-        dc.SetBackground(wxBrush(GetBackgroundColour()));
-        dc.Clear();
-
-        wxSize clientSize = GetClientSize();
-        int cx = clientSize.GetWidth() / 2;
-        int cy = clientSize.GetHeight() * 0.7; // Centro più in basso per lasciare spazio alla scala
-        int radius = std::min(clientSize.GetWidth() / 2, (int)(clientSize.GetHeight() * 0.6)) - 5;
-
-        wxGraphicsContext* gc = wxGraphicsContext::Create(dc);
-        if (gc) {
-            gc->SetPen(wxPen(*wxBLACK, 2));
-            gc->SetBrush(wxBrush(LA2A_ORANGE_VUMETER_COLOR));
-            gc->DrawEllipse(cx - radius, cy - radius, radius * 2, radius * 2);
-
-            gc->SetBrush(wxBrush(GetBackgroundColour()));
-            gc->SetPen(wxTransparentPen);
-            gc->DrawRectangle(cx - radius - 1, cy, radius * 2 + 2, radius + 2);
-            delete gc;
-        } else {
-            dc.SetBrush(wxBrush(LA2A_ORANGE_VUMETER_COLOR));
-            dc.SetPen(wxPen(*wxBLACK, 2));
-            dc.DrawCircle(cx, cy, radius);
-        }
-
-        // Scala del VU meter (es. -20dB a +10dB)
-        float minDb = -20.0f;
-        float maxDb = 10.0f;
-        float rangeDb = maxDb - minDb;
-
-        float startAngleRad = M_PI * 0.75f; // Inizio scala (ore 10:30 circa)
-        float endAngleRad = M_PI * 0.25f;  // Fine scala (ore 1:30 circa)
-        float totalAngleRange = startAngleRad - endAngleRad;
-
-        dc.SetTextForeground(*wxBLACK);
-        dc.SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
-
-        float dbMarks[] = {-20.0f, -10.0f, -5.0f, 0.0f, 5.0f, 10.0f};
-        for (float db : dbMarks) {
-            float normalized = (db - minDb) / rangeDb;
-            float angle = startAngleRad - (normalized * totalAngleRange);
-
-            int markLength = (db == 0.0f) ? 12 : 8; // Tacca più lunga per lo 0dB
-            wxPoint p1(cx + (int)(radius * cos(angle)), cy - (int)(radius * sin(angle)));
-            wxPoint p2(cx + (int)((radius - markLength) * cos(angle)), cy - (int)((radius - markLength) * sin(angle)));
-            dc.SetPen(wxPen(*wxBLACK, 1));
-            dc.DrawLine(p1, p2);
-
-            wxString dbText = wxString::Format("%.0f", db);
-            wxSize textSize = dc.GetTextExtent(dbText);
-            // Posiziona il testo un po' più lontano dalla tacca
-            wxPoint textPos(cx + (int)((radius - markLength - textSize.GetWidth() / 2 - 5) * cos(angle)) - textSize.GetWidth() / 2,
-                            cy - (int)((radius - markLength - textSize.GetHeight() / 2 - 5) * sin(angle)) - textSize.GetHeight() / 2);
-
-            dc.DrawText(dbText, textPos);
-        }
-
-        // Lancetta
-        float normalizedMeterValue = (meterValue - minDb) / rangeDb;
-        if (normalizedMeterValue < 0) normalizedMeterValue = 0;
-        if (normalizedMeterValue > 1) normalizedMeterValue = 1;
-        float needleAngle = startAngleRad - (normalizedMeterValue * totalAngleRange);
-
-        dc.SetPen(wxPen(*wxBLACK, 2));
-        dc.DrawLine(cx, cy,
-                    cx + radius * 0.9 * cos(needleAngle),
-                    cy - radius * 0.9 * sin(needleAngle));
-
-        // Perno centrale
-        dc.SetBrush(wxBrush(*wxBLACK));
-        dc.DrawCircle(cx, cy, 5);
-    }
-};
-
-// --- CLASSE CUSTOM PER TOGGLE SWITCH (per Oversampling, Sidechain Source) ---
-class CustomToggleSwitch : public wxControl {
-public:
-    CustomToggleSwitch(wxWindow* parent, wxWindowID id, const wxString& label, bool initialState = false,
-                       const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize)
-        : wxControl(parent, id, pos, size, wxNO_BORDER),
-          isOn(initialState),
-          textLabel(label) {
-        SetBackgroundStyle(wxBG_STYLE_PAINT);
-        SetBackgroundColour(parent->GetBackgroundColour());
-        Bind(wxEVT_PAINT, &CustomToggleSwitch::OnPaint, this);
-        Bind(wxEVT_LEFT_DOWN, &CustomToggleSwitch::OnMouseLeftDown, this);
-    }
-
-    bool IsOn() const { return isOn; }
-    void SetOn(bool state) {
-        if (isOn != state) {
-            isOn = state;
-            Refresh();
-        }
-    }
-
-private:
-    bool isOn;
-    wxString textLabel;
-
-    void OnPaint(wxPaintEvent& event) {
-        wxAutoBufferedPaintDC dc(this);
-        dc.SetBackground(wxBrush(GetBackgroundColour()));
-        dc.Clear();
-
-        wxSize clientSize = GetClientSize();
-        int width = clientSize.GetWidth();
-        int height = clientSize.GetHeight();
-
-        int rectHeight = height / 2;
-        int rectY = (height - rectHeight) / 2;
-        int roundness = 5;
-
-        dc.SetPen(wxPen(wxColour(80, 80, 80), 1));
-        dc.SetBrush(wxBrush(wxColour(120, 120, 120)));
-        dc.DrawRoundedRectangle(0, rectY, width, rectHeight, roundness);
-
-        int leverWidth = width * 0.6;
-        int leverHeight = rectHeight * 0.8;
-        int leverX = (width - leverWidth) / 2;
-        int leverY;
-
-        if (isOn) {
-            leverY = rectY + rectHeight - leverHeight - 2;
-        } else {
-            leverY = rectY + 2;
-        }
-
-        dc.SetBrush(wxBrush(wxColour(60, 60, 60)));
-        dc.DrawRoundedRectangle(leverX, leverY, leverWidth, leverHeight, roundness / 2);
-
-        dc.SetBrush(*wxWHITE_BRUSH);
-        dc.DrawCircle(leverX + leverWidth / 2, leverY + leverHeight / 2, 3);
-
-        dc.SetTextForeground(*wxBLACK);
-        dc.SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
-        wxSize textSize = dc.GetTextExtent(textLabel);
-        dc.DrawText(textLabel, (width - textSize.GetWidth()) / 2, (isOn ? 2 : height - textSize.GetHeight() - 2));
-    }
-
-    void OnMouseLeftDown(wxMouseEvent& event) {
-        SetOn(!isOn);
-        wxCommandEvent evt(wxEVT_CHECKBOX, GetId());
-        evt.SetEventObject(this);
-        evt.SetInt(isOn ? 1 : 0);
-        GetParent()->ProcessWindowEvent(evt);
-    }
-};
-
-// --- CLASSE CUSTOM PER VALVOLA LUMINOSA ---
-class ValveLightDisplay : public wxControl {
-public:
-    ValveLightDisplay(wxWindow* parent, wxWindowID id, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize, long style = wxNO_BORDER)
-        : wxControl(parent, id, pos, size, style), tubeDriveValue(0.0f) {
-        SetBackgroundStyle(wxBG_STYLE_PAINT);
-        SetBackgroundColour(parent->GetBackgroundColour());
-        Bind(wxEVT_PAINT, &ValveLightDisplay::OnPaint, this);
-    }
-
-    void SetTubeDriveValue(float value) {
-        if (tubeDriveValue != value) {
-            tubeDriveValue = value;
-            Refresh();
-        }
-    }
-
-private:
-    float tubeDriveValue; // Valore da 0.0 a 1.0
-
-    void OnPaint(wxPaintEvent& event) {
-        wxAutoBufferedPaintDC dc(this);
-        dc.SetBackground(wxBrush(GetBackgroundColour()));
-        dc.Clear();
-
-        wxSize clientSize = GetClientSize();
-        int width = clientSize.GetWidth();
-        int height = clientSize.GetHeight();
-
-        // Disegna la fessura esterna (telaio metallico)
-        int frameThickness = 3;
-        dc.SetBrush(wxBrush(wxColour(100, 100, 100))); // Grigio scuro per il telaio
-        dc.SetPen(wxPen(wxColour(80, 80, 80), 1));
-        dc.DrawRoundedRectangle(0, 0, width, height, 5);
-
-        // Disegna la "finestra" interna (leggermente rientrata)
-        dc.SetBrush(wxBrush(LA2A_VALVE_OFF_COLOR)); // Sfondo scuro per la valvola spenta
-        dc.DrawRoundedRectangle(frameThickness, frameThickness,
-                                width - 2 * frameThickness, height - 2 * frameThickness, 3);
-
-        // Calcola il colore del bagliore in base al tubeDriveValue
-        // Da LA2A_VALVE_OFF_COLOR a LA2A_VALVE_ON_COLOR
-        int r = LA2A_VALVE_OFF_COLOR.Red() + (LA2A_VALVE_ON_COLOR.Red() - LA2A_VALVE_OFF_COLOR.Red()) * tubeDriveValue;
-        int g = LA2A_VALVE_OFF_COLOR.Green() + (LA2A_VALVE_ON_COLOR.Green() - LA2A_VALVE_OFF_COLOR.Green()) * tubeDriveValue;
-        int b = LA2A_VALVE_OFF_COLOR.Blue() + (LA2A_VALVE_ON_COLOR.Blue() - LA2A_VALVE_OFF_COLOR.Blue()) * tubeDriveValue;
-
-        // Disegna la "valvola" che si illumina
-        wxGraphicsContext* gc = wxGraphicsContext::Create(dc);
-        if (gc) {
-            gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
-
-            // Crea un gradiente per il bagliore (simula il calore)
-            wxPoint2DDouble startPt(width / 2, height);
-            wxPoint2DDouble endPt(width / 2, 0);
-            wxGraphicsBrush brush = gc->CreateLinearGradientBrush(
-                startPt.m_x, startPt.m_y, endPt.m_x, endPt.m_y,
-                wxColour(r, g, b, 0), // Trasparente alla base
-                wxColour(r, g, b, (unsigned char)(255 * tubeDriveValue * 0.8)) // Pieno in cima, con alfa in base al valore
-            );
-            gc->SetBrush(brush);
-            gc->SetPen(wxTransparentPen);
-
-            // Disegna una forma che simuli una valvola che si illumina
-            wxGraphicsPath path = gc->CreatePath();
-            path.AddRoundedRectangle(frameThickness + 2, frameThickness + 2,
-                                     width - 2 * frameThickness - 4, height - 2 * frameThickness - 4, 3);
-            gc->FillPath(path);
-
-            delete gc;
-        } else {
-            // Fallback (meno effetti, ma mostra il colore)
-            dc.SetBrush(wxBrush(wxColour(r, g, b)));
-            dc.DrawRoundedRectangle(frameThickness + 2, frameThickness + 2,
-                                     width - 2 * frameThickness - 4, height - 2 * frameThickness - 4, 3);
-        }
-    }
-};
+    return value_changed;
+}
 
 
-// Struttura principale della tua GUI
-struct Gla2aUI {
+// =========================================================================
+// Struttura dello Stato della UI
+// =========================================================================
+typedef struct {
+    LV2_UI_Write_Function write_function;
+    LV2_UI_Controller controller;
+    LV2_Log_Logger* logger;
     LV2_URID_Map* map;
     LV2_URID_Unmap* unmap;
-    LV2_UI_Write_Function write_function;
-    LV2_UI_Controller    controller;
 
-    LV2_URID atom_Float;
-    LV2_URID atom_Int;
+    Display* display;
+    Window window;
+    GLXContext glx_context;
 
-    // Riferimenti ai widget wxWidgets
-    wxFrame* frame;
-    wxNotebook* notebook;
-    wxPanel* mainPanel;
-    wxPanel* sidechainPanel;
+    bool imgui_initialized;
 
-    // Controlli sul mainPanel
-    wxButton* inputAttenuatorButton; // -10dB Pad come button
-    CustomKnob* inputGainKnob;        // Manopola Input Gain (BIG)
-    CustomKnob* thresholdKnob;        // Manopola Threshold (BIG)
-    CustomKnob* gainOutKnob;          // Manopola Gain Out (BIG)
-    CustomKnob* gainReductionKnob;    // Nuova manopola Gain Reduction (BIG)
+    // --- Valori dei Parametri (sincronizzati con il plugin audio) ---
+    float peakReduction_val;
+    float gain_val;
+    bool bypass_val;
+    bool ratioMode_val; // false=Comp, true=Limit
+    float valveDrive_val;
+    bool inputPad10dB_val;
+    bool oversamplingOn_val;
+    bool sidechainMode_val;
+    bool scLpOn_val;
+    float scLpFq_val;
+    float scLpQ_val;
+    bool scHpOn_val;
+    float scHpFq_val;
+    float scHpQ_val;
 
-    CustomVUMeter* ioVUMeter;         // VU Meter I/O (BIG)
-    wxButton* ioVUMeterSwitchButton;  // Pulsante per commutare il VU meter I/O
-    CustomVUMeter* grVUMeter;         // VU Meter Gain Reduction (BIG)
+    // --- Valori dei Meter (ricevuti dal plugin, normalizzati 0.0-1.0) ---
+    float peakGR_val;
+    float peakInL_val;
+    float peakInR_val;
+    float peakOutL_val;
+    float peakOutR_val;
 
-    CustomKnob* arPresetKnob;         // Manopola AR Preset (Small)
-    CustomKnob* ratioKnob;            // Manopola Ratio/Mode (Small)
-    CustomKnob* tubeDriveKnob;        // Manopola Tube Drive (Small)
-    ValveLightDisplay* valveLightDisplay; // Visualizzazione valvola
+    bool showOutputMeter; // Toggle per mostrare input/output sul meter principale
 
-    // Controlli sul sidechainPanel
-    CustomToggleSwitch* sidechainSourceSwitch; // Internal/External Key (Switch)
-    CustomToggleSwitch* oversamplingSwitch;    // Upsampling X2 (Switch)
-    CustomKnob* hpfFreqKnob;
-    CustomKnob* hpfQKnob;
-    CustomKnob* lpfFreqKnob;
-    CustomKnob* lpfQKnob;
-    CustomToggleSwitch* sidechainMonitorToggle; // Lasciato come switch per coerenza visiva
+    // --- Texture IDs per i Knob (GL_TEXTURE_2D IDs) ---
+    GLuint knobTextureID_peakReduction;
+    GLuint knobTextureID_gain;
+    GLuint knobTextureID_valveDrive;
+    GLuint knobTextureID_scLpFq;
+    GLuint knobTextureID_scHpFq;
 
-    // Etichette numeriche
-    wxStaticText* inputGainValueText;
-    wxStaticText* thresholdValueText;
-    wxStaticText* gainOutValueText;
-    wxStaticText* gainReductionValueText; // Nuova etichetta
-    wxStaticText* arPresetValueText;
-    wxStaticText* ratioValueText;
-    wxStaticText* tubeDriveValueText;
-    wxStaticText* hpfFreqValueText;
-    wxStaticText* hpfQValueText;
-    wxStaticText* lpfFreqValueText;
-    wxStaticText* lpfQValueText;
+    // --- Dimensione e numero di frame per i Knob ---
+    // Assumiamo che tutti i knob usino sprite sheets con frame quadrati della stessa dimensione
+    int knobFrameWidth;
+    int knobFrameHeight; // Sarà uguale a knobFrameWidth se i frame sono quadrati
+    int knobTotalFrames; // Numero totale di frame in uno sprite sheet (es. 100)
 
-    // Flag per il VU meter mode
-    bool ioVUMeterShowsInput = true; // true = Input, false = Output. Default su Input.
-
-    // Mappa per memorizzare i valori delle porte
-    std::vector<float> port_values;
-
-    wxApp* wx_app_instance;
-    LV2_UI_Idle_Interface* idle_iface;
-
-    // Metodi helper per aggiornare i controlli
-    void UpdateKnobValue(CustomKnob* knob, float value, wxStaticText* text_label, const char* unit = "");
-    void UpdateSwitchValue(CustomToggleSwitch* toggle, int value);
-};
-
-// --- Implementazione dei metodi helper per Gla2aUI ---
-void Gla2aUI::UpdateKnobValue(CustomKnob* knob, float value, wxStaticText* text_label, const char* unit) {
-    knob->SetValue(value);
-    if (text_label) {
-        wxString text;
-        if (knob == arPresetKnob) {
-            // AR Preset (Fast=0, Medium=1, Slow=2)
-            int intValue = static_cast<int>(round(value));
-            switch(intValue) {
-                case 0: text = "Fast"; break;
-                case 1: text = "Medium"; break;
-                case 2: text = "Slow"; break;
-                default: text = "Unknown"; break;
-            }
-        } else if (knob == ratioKnob) {
-            // Ratio / Mode (2:1=0, 4:1=1, 8:1=2, Limit=3)
-            int intValue = static_cast<int>(round(value));
-            switch(intValue) {
-                case 0: text = "2:1"; break;
-                case 1: text = "4:1"; break;
-                case 2: text = "8:1"; break;
-                case 3: text = "LIMIT"; break;
-                default: text = "Unknown"; break;
-            }
-        } else {
-            text = wxString::FromDouble(value, 1); // 1 cifra decimale di default
-            if (strlen(unit) > 0) text += " " + wxString(unit);
-        }
-        text_label->SetLabel(text);
-    }
-}
-
-void Gla2aUI::UpdateSwitchValue(CustomToggleSwitch* toggle, int value) {
-    toggle->SetOn(value == 1);
-}
-
-// --- Funzioni di Callback di wxWidgets per gli eventi UI ---
-void OnKnobChanged(wxCommandEvent& event) {
-    CustomKnob* knob = static_cast<CustomKnob*>(event.GetEventObject());
-    Gla2aUI* ui = static_cast<Gla2aUI*>(knob->GetParent()->GetClientData());
-    float value = knob->GetValue();
-
-    if (knob == ui->inputGainKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_GAIN_IN, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->inputGainKnob, value, ui->inputGainValueText, "dB");
-    } else if (knob == ui->thresholdKnob) { // Ora Threshold
-        ui->write_function(ui->controller, GLA2A_CONTROL_THRESHOLD, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->thresholdKnob, value, ui->thresholdValueText, "dB");
-    } else if (knob == ui->gainOutKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_GAIN_OUT, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->gainOutKnob, value, ui->gainOutValueText, "dB");
-    } else if (knob == ui->gainReductionKnob) { // Nuova manopola Gain Reduction
-        ui->write_function(ui->controller, GLA2A_CONTROL_GAIN_REDUCTION, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->gainReductionKnob, value, ui->gainReductionValueText, "%"); // O un'altra unità
-    } else if (knob == ui->arPresetKnob) {
-        int intValue = static_cast<int>(round(value));
-        ui->write_function(ui->controller, GLA2A_CONTROL_AR_PRESET, sizeof(int), ui->atom_Int, &intValue);
-        ui->UpdateKnobValue(ui->arPresetKnob, value, ui->arPresetValueText);
-    } else if (knob == ui->ratioKnob) {
-        int intValue = static_cast<int>(round(value));
-        ui->write_function(ui->controller, GLA2A_CONTROL_RATIO_SELECT, sizeof(int), ui->atom_Int, &intValue);
-        ui->UpdateKnobValue(ui->ratioKnob, value, ui->ratioValueText);
-    } else if (knob == ui->tubeDriveKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_TUBE_DRIVE, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->tubeDriveKnob, value, ui->tubeDriveValueText, "");
-        if (ui->valveLightDisplay) ui->valveLightDisplay->SetTubeDriveValue(value);
-    } else if (knob == ui->hpfFreqKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_SIDECHAIN_HPF_FREQ, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->hpfFreqKnob, value, ui->hpfFreqValueText, "Hz");
-    } else if (knob == ui->hpfQKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_SIDECHAIN_HPF_Q, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->hpfQKnob, value, ui->hpfQValueText, "");
-    } else if (knob == ui->lpfFreqKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_SIDECHAIN_LPF_FREQ, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->lpfFreqKnob, value, ui->lpfFreqValueText, "Hz");
-    } else if (knob == ui->lpfQKnob) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_SIDECHAIN_LPF_Q, sizeof(float), ui->atom_Float, &value);
-        ui->UpdateKnobValue(ui->lpfQKnob, value, ui->lpfQValueText, "");
-    }
-}
-
-void OnSwitchChanged(wxCommandEvent& event) {
-    CustomToggleSwitch* toggle = static_cast<CustomToggleSwitch*>(event.GetEventObject());
-    Gla2aUI* ui = static_cast<Gla2aUI*>(toggle->GetParent()->GetClientData());
-    int value = toggle->IsOn() ? 1 : 0;
-
-    if (toggle == ui->sidechainSourceSwitch) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_SIDECHAIN_MODE, sizeof(int), ui->atom_Int, &value);
-    } else if (toggle == ui->oversamplingSwitch) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_OVERSAMPLING_MODE, sizeof(int), ui->atom_Int, &value);
-    } else if (toggle == ui->sidechainMonitorToggle) {
-        ui->write_function(ui->controller, GLA2A_CONTROL_SIDECHAIN_MONITOR_MODE, sizeof(int), ui->atom_Int, &value);
-    }
-}
-
-void OnInputAttenuatorButtonClicked(wxCommandEvent& event) {
-    wxButton* button = static_cast<wxButton*>(event.GetEventObject());
-    Gla2aUI* ui = static_cast<Gla2aUI*>(button->GetClientData());
-    int currentValue = (int)ui->port_values[GLA2A_CONTROL_INPUT_ATTENUATOR];
-    int newValue = (currentValue == 0) ? 1 : 0; // Toggle 0/1
-
-    ui->write_function(ui->controller, GLA2A_CONTROL_INPUT_ATTENUATOR, sizeof(int), ui->atom_Int, &newValue);
-    ui->port_values[GLA2A_CONTROL_INPUT_ATTENUATOR] = (float)newValue; // Update local state
-    // Aggiorna l'aspetto del pulsante, ad es. cambiando colore o testo se desiderato
-    if (newValue == 1) {
-        button->SetBackgroundColour(*wxRED); // Esempio: rosso quando attivo
-    } else {
-        button->SetBackgroundColour(wxNullColour); // Torna al colore predefinito
-    }
-    button->Refresh();
-}
-
-void OnIOVUMeterSwitchButtonClicked(wxCommandEvent& event) {
-    Gla2aUI* ui = static_cast<Gla2aUI*>(event.GetClientData());
-    ui->ioVUMeterShowsInput = !ui->ioVUMeterShowsInput;
-    ui->ioVUMeterSwitchButton->SetLabel(ui->ioVUMeterShowsInput ? "Input" : "Output");
-    ui->ioVUMeter->Refresh(); // Forziamo il ridisegno per riflettere il cambio
-}
+    // --- Texture IDs per i Pulsanti Toggle (se usi immagini) ---
+    GLuint toggleSwitchTextureID_on;
+    GLuint toggleSwitchTextureID_off;
+    int toggleSwitchWidth;
+    int toggleSwitchHeight;
 
 
-// --- Funzioni dell'Interfaccia LV2 UI ---
+} Gla2aUI;
+
+
+// =========================================================================
+// Callbacks LV2 (instantiate, cleanup, port_event, ui_idle)
+// =========================================================================
 
 static LV2_UI_Handle instantiate(const LV2_UI_Descriptor* descriptor,
                                  const char* plugin_uri,
                                  const char* bundle_path,
-                                 LV2_UI_Write_Function write_function,
-                                 LV2_UI_Controller controller,
-                                 LV2_UI_Widget* widget,
+                                 LV2_UI_Write_Function    write_function,
+                                 LV2_UI_Controller        controller,
+                                 LV2_UI_Widget_Handle* widget,
                                  const LV2_Feature* const* features) {
     Gla2aUI* ui = (Gla2aUI*)calloc(1, sizeof(Gla2aUI));
-    if (!ui) return NULL;
-
     ui->write_function = write_function;
-    ui->controller     = controller;
-    ui->port_values.resize(24, 0.0f); // Adatta la dimensione al numero massimo di porte LV2, includendo i nuovi VU meters
+    ui->controller = controller;
+    ui->imgui_initialized = false;
+    ui->showOutputMeter = true;
 
-    const LV2_URID_Map* map_feature = NULL;
-    LV2_UI_Idle_Interface* idle_iface_feature = NULL;
-    const LV2_UI_Parent* parent_feature = NULL;
+    // Inizializza i valori predefiniti dei parametri (devono corrispondere a quelli del plugin)
+    ui->peakReduction_val = -20.0f;
+    ui->gain_val = 0.0f;
+    ui->bypass_val = false;
+    ui->ratioMode_val = false;
+    ui->valveDrive_val = 0.5f;
+    ui->inputPad10dB_val = false;
+    ui->oversamplingOn_val = true;
+    ui->sidechainMode_val = false;
+    ui->scLpOn_val = false;
+    ui->scLpFq_val = 2000.0f;
+    ui->scLpQ_val = 0.707f;
+    ui->scHpOn_val = false;
+    ui->scHpFq_val = 100.0f;
+    ui->scHpQ_val = 0.707f;
 
+    // Inizializza i valori dei meter (0.0 = -Inf dB, usa -40dB o simile come base)
+    ui->peakGR_val = 0.0f;
+    ui->peakInL_val = 0.0f;
+    ui->peakInR_val = 0.0f;
+    ui->peakOutL_val = 0.0f;
+    ui->peakOutR_val = 0.0f;
+
+    // Estrai le feature necessarie
     for (int i = 0; features[i]; ++i) {
         if (!strcmp(features[i]->URI, LV2_URID__map)) {
-            map_feature = (const LV2_URID_Map*)features[i]->data;
-        } else if (!strcmp(features[i]->URI, LV2_UI__idleInterface)) {
-            idle_iface_feature = (LV2_UI_Idle_Interface*)features[i]->data;
+            ui->map = (LV2_URID_Map*)features[i]->data;
+            urid_map = *ui->map;
+        } else if (!strcmp(features[i]->URI, LV2_URID__unmap)) {
+            ui->unmap = (LV2_URID_Unmap*)features[i]->data;
+            urid_unmap = *ui->unmap;
+        } else if (!strcmp(features[i]->URI, LV2_LOG__log)) {
+            ui->logger = (LV2_Log_Logger*)features[i]->data;
+            lv2_log_logger_set_log_level(ui->logger, LV2_LOG_Trace);
+            logger = *ui->logger;
         } else if (!strcmp(features[i]->URI, LV2_UI__parent)) {
-            parent_feature = (const LV2_UI_Parent*)features[i]->data;
+            ui->window = (Window)(uintptr_t)features[i]->data;
+        } else if (!strcmp(features[i]->URI, LV2_UI__X11Display)) {
+            ui->display = (Display*)features[i]->data;
         }
     }
 
-    if (!map_feature) {
-        fprintf(stderr, "Gla2aUI: Host does not provide URID Map feature.\n");
+    if (!ui->map || !ui->display || !ui->window) {
+        lv2_log_error(&logger, "Gla2a UI: Missing required features (URID map, X11 Display, Parent window).\n");
         free(ui);
         return NULL;
     }
-    ui->map = (LV2_URID_Map*)map_feature;
-    ui->unmap = (LV2_URID_Unmap*)lv2_feature_data(features, LV2_URID__unmap);
 
-    ui->atom_Float = ui->map->map(ui->map->handle, LV2_ATOM__Float);
-    ui->atom_Int   = ui->map->map(ui->map->handle, LV2_ATOM__Int);
+    // Mappa gli URI dei parametri (DEVONO CORRISPONDERE agli URI nel tuo plugin TTL e codice audio)
+    // Sostituisci "http://your-plugin.com/gla2a#" con l'URI effettivo del tuo plugin
+    peakReduction_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#peakReduction");
+    gain_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#gain");
+    bypass_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#bypass");
+    ratioMode_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#ratioMode");
+    valveDrive_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#valveDrive");
+    inputPad10dB_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#inputPad10dB");
+    oversamplingOn_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#oversamplingOn");
+    sidechainMode_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#sidechainMode");
+    scLpOn_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#scLpOn");
+    scLpFq_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#scLpFq");
+    scLpQ_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#scLpQ");
+    scHpOn_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#scHpOn");
+    scHpFq_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#scHpFq");
+    scHpQ_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#scHpQ");
 
-    ui->idle_iface = idle_iface_feature;
-
-    wxInitialize();
-
-    ui->frame = new wxFrame(NULL, wxID_ANY, "GLA2A Compressor", wxPoint(100, 100), wxSize(800, 500),
-                            wxDEFAULT_FRAME_STYLE & ~(wxRESIZE_BORDER | wxMAXIMIZE_BOX));
-    ui->frame->SetBackgroundColour(LA2A_BEIGE_COLOR);
-    ui->frame->SetExtraStyle(wxWS_EX_PROCESS_IDLE);
-
-    *widget = (LV2_UI_Widget)ui->frame->GetHandle();
-
-    ui->notebook = new wxNotebook(ui->frame, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxNB_TOP);
-    ui->notebook->SetBackgroundColour(LA2A_BEIGE_COLOR);
-
-    // --- Crea il Pannello Principale ("Main" Tab) ---
-    ui->mainPanel = new wxPanel(ui->notebook, wxID_ANY);
-    ui->mainPanel->SetBackgroundColour(LA2A_BEIGE_COLOR);
-    ui->mainPanel->SetClientData(ui);
-    ui->notebook->AddPage(ui->mainPanel, "Main", true);
-
-    wxBoxSizer* mainSizer = new wxBoxSizer(wxVERTICAL);
-    ui->mainPanel->SetSizer(mainSizer);
-
-    // **Riga Superiore: Pad, Input Gain, Threshold, Gain Out**
-    wxBoxSizer* topControlsSizer = new wxBoxSizer(wxHORIZONTAL);
-    mainSizer->Add(topControlsSizer, 0, wxEXPAND | wxALL, 5);
-
-    // -10dB PAD Button
-    wxBoxSizer* padSizer = new wxBoxSizer(wxVERTICAL);
-    ui->inputAttenuatorButton = new wxButton(ui->mainPanel, wxID_ANY, "-10dB PAD", wxDefaultPosition, wxSize(70, 40));
-    ui->inputAttenuatorButton->SetClientData(ui);
-    ui->inputAttenuatorButton->Bind(wxEVT_BUTTON, &OnInputAttenuatorButtonClicked);
-    padSizer->Add(ui->inputAttenuatorButton, 0, wxALIGN_CENTER_HORIZONTAL);
-    topControlsSizer->Add(padSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-
-    // Input Gain Knob (BIG)
-    wxBoxSizer* inputGainSizer = new wxBoxSizer(wxVERTICAL);
-    ui->inputGainKnob = new CustomKnob(ui->mainPanel, wxID_ANY, -20.0f, 20.0f, 0.0f, wxDefaultPosition, wxSize(80, 100));
-    ui->inputGainKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    inputGainSizer->Add(ui->inputGainKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->inputGainValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "0.0 dB");
-    inputGainSizer->Add(ui->inputGainValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    inputGainSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "INPUT GAIN"), 0, wxALIGN_CENTER_HORIZONTAL);
-    topControlsSizer->Add(inputGainSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-
-    // Threshold Knob (BIG)
-    wxBoxSizer* thresholdSizer = new wxBoxSizer(wxVERTICAL);
-    ui->thresholdKnob = new CustomKnob(ui->mainPanel, wxID_ANY, -40.0f, 0.0f, -20.0f, wxDefaultPosition, wxSize(80, 100));
-    ui->thresholdKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    thresholdSizer->Add(ui->thresholdKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->thresholdValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "-20.0 dB");
-    thresholdSizer->Add(ui->thresholdValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    thresholdSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "THRESHOLD"), 0, wxALIGN_CENTER_HORIZONTAL);
-    topControlsSizer->Add(thresholdSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-
-    topControlsSizer->AddStretchSpacer(); // Spazio per il titolo
-
-    // Plugin Title
-    wxStaticText* titleText = new wxStaticText(ui->mainPanel, wxID_ANY, "GLA2A Compressor", wxDefaultPosition, wxDefaultSize, wxALIGN_CENTER);
-    titleText->SetFont(wxFont(18, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
-    topControlsSizer->Add(titleText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 10);
-
-    topControlsSizer->AddStretchSpacer(); // Spazio
-
-    // Gain Out Knob (BIG)
-    wxBoxSizer* gainOutSizer = new wxBoxSizer(wxVERTICAL);
-    ui->gainOutKnob = new CustomKnob(ui->mainPanel, wxID_ANY, -20.0f, 20.0f, 0.0f, wxDefaultPosition, wxSize(80, 100));
-    ui->gainOutKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    gainOutSizer->Add(ui->gainOutKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->gainOutValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "0.0 dB");
-    gainOutSizer->Add(ui->gainOutValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    gainOutSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "GAIN OUT"), 0, wxALIGN_CENTER_HORIZONTAL);
-    topControlsSizer->Add(gainOutSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-
-    // **Riga Centrale: Gain Reduction Knob e VU Meters**
-    wxBoxSizer* middleSectionSizer = new wxBoxSizer(wxHORIZONTAL);
-    mainSizer->Add(middleSectionSizer, 1, wxEXPAND | wxALL, 5); // 1 = espandibile verticalmente
-
-    middleSectionSizer->AddStretchSpacer();
-
-    // Gain Reduction Knob (BIG)
-    wxBoxSizer* gainReductionKnobSizer = new wxBoxSizer(wxVERTICAL);
-    ui->gainReductionKnob = new CustomKnob(ui->mainPanel, wxID_ANY, 0.0f, 100.0f, 50.0f, wxDefaultPosition, wxSize(80, 100)); // Adatta range e default
-    ui->gainReductionKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    gainReductionKnobSizer->Add(ui->gainReductionKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->gainReductionValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "50.0 %");
-    gainReductionKnobSizer->Add(ui->gainReductionValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    gainReductionKnobSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "GAIN REDUCTION"), 0, wxALIGN_CENTER_HORIZONTAL);
-    middleSectionSizer->Add(gainReductionKnobSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 10);
-
-    middleSectionSizer->AddStretchSpacer();
-
-    // I/O VU Meter (BIG)
-    wxBoxSizer* ioVUMeterSizer = new wxBoxSizer(wxVERTICAL);
-    ui->ioVUMeter = new CustomVUMeter(ui->mainPanel, wxID_ANY, wxDefaultPosition, wxSize(150, 180));
-    ioVUMeterSizer->Add(ui->ioVUMeter, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->ioVUMeterSwitchButton = new wxButton(ui->mainPanel, wxID_ANY, "Input"); // Default su "Input"
-    ui->ioVUMeterSwitchButton->SetClientData(ui);
-    ui->ioVUMeterSwitchButton->Bind(wxEVT_BUTTON, &OnIOVUMeterSwitchButtonClicked);
-    ioVUMeterSizer->Add(ui->ioVUMeterSwitchButton, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 5);
-    ioVUMeterSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "I/O METER"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
-    middleSectionSizer->Add(ioVUMeterSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 10);
-
-    middleSectionSizer->AddStretchSpacer();
-
-    // Gain Reduction VU Meter (BIG)
-    // Non hai specificato un VU meter di GR separato nel nuovo layout, ma lo tengo se vuoi ripristinarlo.
-    // Se la manopola "Gain Reduction" e il VU meter "I/O" sono gli unici grandi elementi centrali,
-    // allora il layout dovrà essere adeguato per riempirli.
-    // Per ora, assumo che il tuo "Big I/O switchable meter" sia l'unico VU meter.
-    // Se invece vuoi anche un VU meter GR separato, dovremmo aggiungerlo qui.
-    // Nel tuo ultimo layout hai detto "Big I/O switchable meter", e basta.
-    // Se vuoi un secondo VU meter, devo ricrearlo e posizionarlo.
-
-    // Aggiungo uno spazio che terrebbe il posto di un secondo VU meter o semplicemente per spaziatura
-    middleSectionSizer->AddStretchSpacer();
+    peakGR_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#peakGR");
+    peakInL_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#peakInL");
+    peakInR_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#peakInR");
+    peakOutL_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#peakOutL");
+    peakOutR_URID = ui->map->map(ui->map->handle, "http://your-plugin.com/gla2a#peakOutR");
 
 
-    // **Riga Inferiore: AR Preset, Ratio/Mode, Tube Drive, Valvola**
-    wxBoxSizer* bottomControlsSizer = new wxBoxSizer(wxHORIZONTAL);
-    mainSizer->Add(bottomControlsSizer, 0, wxEXPAND | wxALL, 5);
+    // --- Inizializzazione OpenGL ---
+    XWindowAttributes wa;
+    XGetWindowAttributes(ui->display, ui->window, &wa);
 
-    bottomControlsSizer->AddStretchSpacer();
+    GLint att[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
+    XVisualInfo* vi = glXChooseVisual(ui->display, 0, att);
+    if (!vi) {
+        lv2_log_error(&logger, "Gla2a UI: No appropriate visual found for OpenGL.\n");
+        free(ui);
+        return NULL;
+    }
 
-    // AR Preset Knob (Small)
-    wxBoxSizer* arPresetSizer = new wxBoxSizer(wxVERTICAL);
-    ui->arPresetKnob = new CustomKnob(ui->mainPanel, wxID_ANY, 0.0f, 2.0f, 1.0f, wxDefaultPosition, wxSize(60, 80));
-    ui->arPresetKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    arPresetSizer->Add(ui->arPresetKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->arPresetValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "Medium");
-    arPresetSizer->Add(ui->arPresetValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    arPresetSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "A/R PRESET"), 0, wxALIGN_CENTER_HORIZONTAL);
-    bottomControlsSizer->Add(arPresetSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+    ui->glx_context = glXCreateContext(ui->display, vi, NULL, GL_TRUE);
+    if (!ui->glx_context) {
+        lv2_log_error(&logger, "Gla2a UI: Failed to create GLX context.\n");
+        XFree(vi);
+        free(ui);
+        return NULL;
+    }
+    XFree(vi);
 
-    bottomControlsSizer->AddStretchSpacer();
+    glXMakeCurrent(ui->display, ui->window, ui->glx_context);
 
-    // Ratio/Mode Knob (Small)
-    wxBoxSizer* ratioSizer = new wxBoxSizer(wxVERTICAL);
-    ui->ratioKnob = new CustomKnob(ui->mainPanel, wxID_ANY, 0.0f, 3.0f, 0.0f, wxDefaultPosition, wxSize(60, 80));
-    ui->ratioKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    ui->ratioKnob->SetLabels({"2:1", "4:1", "8:1", "LIMIT"});
-    ratioSizer->Add(ui->ratioKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->ratioValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "2:1");
-    ratioSizer->Add(ui->ratioValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    ratioSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "RATIO/MODE"), 0, wxALIGN_CENTER_HORIZONTAL);
-    bottomControlsSizer->Add(ratioSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+    // --- Caricamento delle texture per i Knob e Toggle Switches ---
+    // Assicurati che questi path siano corretti rispetto al tuo bundle LV2
+    // Esempio: Gla2a.lv2/gui/assets/knob_pr.png
+    std::string bundle_str(bundle_path);
+    std::string assets_path = bundle_str + "/gui/assets/"; // Assumi che hai una cartella 'assets' dentro 'gui'
 
-    bottomControlsSizer->AddStretchSpacer();
+    // Carica il primo knob (dimensione del frame viene impostata qui)
+    ui->knobTextureID_peakReduction = LoadTextureFromFile((assets_path + "knob_pr.png").c_str(), &ui->knobFrameWidth, &ui->knobFrameHeight);
+    if (ui->knobTextureID_peakReduction != 0) {
+        ui->knobTotalFrames = ui->knobFrameHeight / ui->knobFrameWidth; // Assumi frame quadrati in colonna
+        if (ui->knobTotalFrames == 0) {
+             lv2_log_error(&logger, "Gla2a UI: Knob texture 'knob_pr.png' has invalid dimensions (height not multiple of width).\n");
+        }
+    } else {
+         lv2_log_error(&logger, "Gla2a UI: Failed to load knob_pr.png\n");
+    }
 
-    // Tube Drive Knob (Small)
-    wxBoxSizer* tubeDriveSizer = new wxBoxSizer(wxVERTICAL);
-    ui->tubeDriveKnob = new CustomKnob(ui->mainPanel, wxID_ANY, 0.0f, 1.0f, 0.0f, wxDefaultPosition, wxSize(60, 80));
-    ui->tubeDriveKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    tubeDriveSizer->Add(ui->tubeDriveKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->tubeDriveValueText = new wxStaticText(ui->mainPanel, wxID_ANY, "0.0");
-    tubeDriveSizer->Add(ui->tubeDriveValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    tubeDriveSizer->Add(new wxStaticText(ui->mainPanel, wxID_ANY, "VALVE DRIVE"), 0, wxALIGN_CENTER_HORIZONTAL);
-    bottomControlsSizer->Add(tubeDriveSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+    // Carica gli altri knob, riusando la stessa dimensione dei frame se sono uguali
+    ui->knobTextureID_gain       = LoadTextureFromFile((assets_path + "knob_gain.png").c_str(), &ui->knobFrameWidth, &ui->knobFrameHeight);
+    ui->knobTextureID_valveDrive = LoadTextureFromFile((assets_path + "knob_drive.png").c_str(), &ui->knobFrameWidth, &ui->knobFrameHeight);
+    ui->knobTextureID_scLpFq     = LoadTextureFromFile((assets_path + "knob_sc_fq.png").c_str(), &ui->knobFrameWidth, &ui->knobFrameHeight);
+    ui->knobTextureID_scHpFq     = LoadTextureFromFile((assets_path + "knob_sc_fq.png").c_str(), &ui->knobFrameWidth, &ui->knobFrameHeight);
 
-    // Valve Light Display
-    ui->valveLightDisplay = new ValveLightDisplay(ui->mainPanel, wxID_ANY, wxDefaultPosition, wxSize(50, 80));
-    bottomControlsSizer->Add(ui->valveLightDisplay, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-    bottomControlsSizer->AddStretchSpacer();
-
-
-    // --- Crea il Pannello Sidechain & Advanced ("Sidechain" Tab) ---
-    ui->sidechainPanel = new wxPanel(ui->notebook, wxID_ANY);
-    ui->sidechainPanel->SetBackgroundColour(LA2A_BEIGE_COLOR);
-    ui->sidechainPanel->SetClientData(ui);
-    ui->notebook->AddPage(ui->sidechainPanel, "Sidechain & Advanced", false);
-
-    wxBoxSizer* sidechainSizer = new wxBoxSizer(wxVERTICAL);
-    ui->sidechainPanel->SetSizer(sidechainSizer);
-
-    // Riga 1: Sidechain Source Switch e Oversampling Switch
-    wxBoxSizer* topSidechainSizer = new wxBoxSizer(wxHORIZONTAL);
-    sidechainSizer->Add(topSidechainSizer, 0, wxEXPAND | wxALL, 10);
-
-    topSidechainSizer->AddStretchSpacer();
-    // Sidechain Source Switch
-    ui->sidechainSourceSwitch = new CustomToggleSwitch(ui->sidechainPanel, wxID_ANY, "EXTERNAL KEY", false, wxDefaultPosition, wxSize(80, 40));
-    ui->sidechainSourceSwitch->Bind(wxEVT_CHECKBOX, &OnSwitchChanged);
-    topSidechainSizer->Add(ui->sidechainSourceSwitch, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-    topSidechainSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "SIDECHAIN SOURCE"), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 5);
-
-    topSidechainSizer->AddStretchSpacer();
-
-    // Oversampling Switch (Default ON)
-    ui->oversamplingSwitch = new CustomToggleSwitch(ui->sidechainPanel, wxID_ANY, "2X OS", true, wxDefaultPosition, wxSize(80, 40)); // Default TRUE
-    ui->oversamplingSwitch->Bind(wxEVT_CHECKBOX, &OnSwitchChanged);
-    topSidechainSizer->Add(ui->oversamplingSwitch, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-    topSidechainSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "UPSAMPLING x2"), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 5);
-    topSidechainSizer->AddStretchSpacer();
+    // Carica le texture per i toggle switches (es. immagini separate per ON/OFF)
+    ui->toggleSwitchTextureID_on = LoadTextureFromFile((assets_path + "toggle_on.png").c_str(), &ui->toggleSwitchWidth, &ui->toggleSwitchHeight);
+    ui->toggleSwitchTextureID_off = LoadTextureFromFile((assets_path + "toggle_off.png").c_str(), &ui->toggleSwitchWidth, &ui->toggleSwitchHeight);
+    if (ui->toggleSwitchTextureID_on == 0 || ui->toggleSwitchTextureID_off == 0) {
+        lv2_log_error(&logger, "Gla2a UI: Failed to load toggle switch textures.\n");
+    }
 
 
-    // Riga 2: HPF Freq & Q, LPF Freq & Q
-    wxBoxSizer* filterControlsSizer = new wxBoxSizer(wxHORIZONTAL);
-    sidechainSizer->Add(filterControlsSizer, 0, wxEXPAND | wxALL, 5);
+    // --- Inizializzazione ImGui ---
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable; // Richiede un host che gestisce le finestre di ImGui
 
-    filterControlsSizer->AddStretchSpacer();
-    // HPF Freq
-    wxBoxSizer* hpfFreqSizer = new wxBoxSizer(wxVERTICAL);
-    ui->hpfFreqKnob = new CustomKnob(ui->sidechainPanel, wxID_ANY, 20.0f, 20000.0f, 20.0f, wxDefaultPosition, wxSize(60, 80));
-    ui->hpfFreqKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    hpfFreqSizer->Add(ui->hpfFreqKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->hpfFreqValueText = new wxStaticText(ui->sidechainPanel, wxID_ANY, "20 Hz");
-    hpfFreqSizer->Add(ui->hpfFreqValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    hpfFreqSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "HPF FREQ"), 0, wxALIGN_CENTER_HORIZONTAL);
-    filterControlsSizer->Add(hpfFreqSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+    // Imposta lo stile di ImGui (personalizzato per un look più "hardware")
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.ChildRounding = 4.0f;
+    style.PopupRounding = 4.0f;
+    style.WindowRounding = 4.0f;
+    style.ScrollbarRounding = 9.0f;
+    style.TabRounding = 4.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
 
-    // HPF Q
-    wxBoxSizer* hpfQSizer = new wxBoxSizer(wxVERTICAL);
-    ui->hpfQKnob = new CustomKnob(ui->sidechainPanel, wxID_ANY, 0.1f, 5.0f, 0.707f, wxDefaultPosition, wxSize(60, 80));
-    ui->hpfQKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    hpfQSizer->Add(ui->hpfQKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->hpfQValueText = new wxStaticText(ui->sidechainPanel, wxID_ANY, "0.7");
-    hpfQSizer->Add(ui->hpfQValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    hpfQSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "HPF Q"), 0, wxALIGN_CENTER_HORIZONTAL);
-    filterControlsSizer->Add(hpfQSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.10f, 0.10f, 0.10f, 0.53f);
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.35f, 0.35f, 0.35f, 1.00f);
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.45f, 0.45f, 0.45f, 1.00f);
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.55f, 0.55f, 0.55f, 1.00f);
+    style.Colors[ImGuiCol_CheckMark] = ImVec4(0.00f, 0.80f, 0.00f, 1.00f); // Spunta verde per checkbox
+    style.Colors[ImGuiCol_Text] = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+    style.Colors[ImGuiCol_Border] = ImVec4(0.00f, 0.00f, 0.00f, 0.50f); // Bordo scuro
 
-    filterControlsSizer->AddStretchSpacer();
+    ImGui_ImplOpenGL3_Init("#version 130");
 
-    // LPF Freq
-    wxBoxSizer* lpfFreqSizer = new wxBoxSizer(wxVERTICAL);
-    ui->lpfFreqKnob = new CustomKnob(ui->sidechainPanel, wxID_ANY, 20.0f, 20000.0f, 20000.0f, wxDefaultPosition, wxSize(60, 80));
-    ui->lpfFreqKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    lpfFreqSizer->Add(ui->lpfFreqKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->lpfFreqValueText = new wxStaticText(ui->sidechainPanel, wxID_ANY, "20000 Hz");
-    lpfFreqSizer->Add(ui->lpfFreqValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    lpfFreqSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "LPF FREQ"), 0, wxALIGN_CENTER_HORIZONTAL);
-    filterControlsSizer->Add(lpfFreqSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+    ui->imgui_initialized = true;
 
-    // LPF Q
-    wxBoxSizer* lpfQSizer = new wxBoxSizer(wxVERTICAL);
-    ui->lpfQKnob = new CustomKnob(ui->sidechainPanel, wxID_ANY, 0.1f, 5.0f, 0.707f, wxDefaultPosition, wxSize(60, 80));
-    ui->lpfQKnob->Bind(wxEVT_SLIDER, &OnKnobChanged);
-    lpfQSizer->Add(ui->lpfQKnob, 0, wxALIGN_CENTER_HORIZONTAL);
-    ui->lpfQValueText = new wxStaticText(ui->sidechainPanel, wxID_ANY, "0.7");
-    lpfQSizer->Add(ui->lpfQValueText, 0, wxALIGN_CENTER_HORIZONTAL);
-    lpfQSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "LPF Q"), 0, wxALIGN_CENTER_HORIZONTAL);
-    filterControlsSizer->Add(lpfQSizer, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-    filterControlsSizer->AddStretchSpacer();
-
-    // Riga 3: Sidechain Monitor (Se richiesto, altrimenti rimosso)
-    // Non menzionato esplicitamente nell'ultimo layout, ma lascio qui se vuoi riaggiungerlo.
-    wxBoxSizer* bottomSidechainSizer = new wxBoxSizer(wxHORIZONTAL);
-    sidechainSizer->Add(bottomSidechainSizer, 0, wxEXPAND | wxALL, 5);
-    bottomSidechainSizer->AddStretchSpacer();
-    ui->sidechainMonitorToggle = new CustomToggleSwitch(ui->sidechainPanel, wxID_ANY, "MONITOR", false, wxDefaultPosition, wxSize(60, 40));
-    ui->sidechainMonitorToggle->Bind(wxEVT_CHECKBOX, &OnSwitchChanged);
-    bottomSidechainSizer->Add(ui->sidechainMonitorToggle, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-    bottomSidechainSizer->Add(new wxStaticText(ui->sidechainPanel, wxID_ANY, "SIDECHAIN MONITOR"), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 5);
-    bottomSidechainSizer->AddStretchSpacer();
-
-
-    ui->frame->SetSizerAndFit(new wxBoxSizer(wxVERTICAL));
-    ui->frame->GetSizer()->Add(ui->notebook, 1, wxEXPAND | wxALL, 0);
-
-    ui->frame->Layout();
-    ui->frame->Show(true);
-
-    // Inizializza i valori UI
-    ui->UpdateKnobValue(ui->inputGainKnob, 0.0f, ui->inputGainValueText, "dB");
-    ui->UpdateKnobValue(ui->thresholdKnob, -20.0f, ui->thresholdValueText, "dB");
-    ui->UpdateKnobValue(ui->gainOutKnob, 0.0f, ui->gainOutValueText, "dB");
-    ui->UpdateKnobValue(ui->gainReductionKnob, 50.0f, ui->gainReductionValueText, "%"); // Default per Gain Reduction
-    // Il pulsante -10dB PAD non ha un metodo UpdateToggleValue per CustomToggleSwitch, gestito in port_event.
-    // Impostiamo lo stato iniziale del pulsante se necessario
-    // ui->inputAttenuatorButton->SetBackgroundColour(wxNullColour); // Default spento
-    ui->UpdateKnobValue(ui->arPresetKnob, 1.0f, ui->arPresetValueText);
-    ui->UpdateKnobValue(ui->ratioKnob, 0.0f, ui->ratioValueText);
-    ui->UpdateKnobValue(ui->tubeDriveKnob, 0.0f, ui->tubeDriveValueText);
-    ui->valveLightDisplay->SetTubeDriveValue(0.0f); // Valvola spenta all'inizio
-
-    ui->UpdateSwitchValue(ui->sidechainSourceSwitch, 0); // Internal Key
-    ui->UpdateSwitchValue(ui->oversamplingSwitch, 1);    // Default ON per Oversampling
-    ui->UpdateKnobValue(ui->hpfFreqKnob, 20.0f, ui->hpfFreqValueText, "Hz");
-    ui->UpdateKnobValue(ui->hpfQKnob, 0.707f, ui->hpfQValueText);
-    ui->UpdateKnobValue(ui->lpfFreqKnob, 20000.0f, ui->lpfFreqValueText, "Hz");
-    ui->UpdateKnobValue(ui->lpfQKnob, 0.707f, ui->lpfQValueText);
-    ui->UpdateSwitchValue(ui->sidechainMonitorToggle, 0);
-
-
+    *widget = (LV2_UI_Widget_Handle)ui->window;
     return (LV2_UI_Handle)ui;
 }
 
-static void port_event(LV2_UI_Handle handle,
-                       uint32_t      port_index,
-                       uint32_t      buffer_size,
-                       uint32_t      format,
-                       const void* buffer) {
-    Gla2aUI* ui = (Gla2aUI*)handle;
+static void cleanup(LV2_UI_Handle ui_handle) {
+    Gla2aUI* ui = (Gla2aUI*)ui_handle;
 
-    if (port_index >= ui->port_values.size()) {
-        fprintf(stderr, "Gla2aUI: port_event received for invalid port index %d\n", port_index);
-        return;
+    if (ui->imgui_initialized) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui::DestroyContext();
     }
 
-    if (format == ui->atom_Float) {
-        float value = *(const float*)buffer;
-        ui->port_values[port_index] = value;
+    // Libera le texture OpenGL
+    if (ui->knobTextureID_peakReduction) glDeleteTextures(1, &ui->knobTextureID_peakReduction);
+    if (ui->knobTextureID_gain) glDeleteTextures(1, &ui->knobTextureID_gain);
+    if (ui->knobTextureID_valveDrive) glDeleteTextures(1, &ui->knobTextureID_valveDrive);
+    if (ui->knobTextureID_scLpFq) glDeleteTextures(1, &ui->knobTextureID_scLpFq);
+    if (ui->knobTextureID_scHpFq) glDeleteTextures(1, &ui->knobTextureID_scHpFq);
+    if (ui->toggleSwitchTextureID_on) glDeleteTextures(1, &ui->toggleSwitchTextureID_on);
+    if (ui->toggleSwitchTextureID_off) glDeleteTextures(1, &ui->toggleSwitchTextureID_off);
 
-        switch ((PortIndex)port_index) {
-            case GLA2A_CONTROL_GAIN_IN:
-                ui->UpdateKnobValue(ui->inputGainKnob, value, ui->inputGainValueText, "dB");
-                break;
-            case GLA2A_CONTROL_THRESHOLD: // Aggiornato a Threshold
-                ui->UpdateKnobValue(ui->thresholdKnob, value, ui->thresholdValueText, "dB");
-                break;
-            case GLA2A_CONTROL_GAIN_OUT:
-                ui->UpdateKnobValue(ui->gainOutKnob, value, ui->gainOutValueText, "dB");
-                break;
-            case GLA2A_CONTROL_GAIN_REDUCTION: // Nuova manopola GR
-                ui->UpdateKnobValue(ui->gainReductionKnob, value, ui->gainReductionValueText, "%");
-                break;
-            case GLA2A_CONTROL_TUBE_DRIVE:
-                 ui->UpdateKnobValue(ui->tubeDriveKnob, value, ui->tubeDriveValueText);
-                 if (ui->valveLightDisplay) ui->valveLightDisplay->SetTubeDriveValue(value);
-                 break;
-            case GLA2A_CONTROL_SIDECHAIN_HPF_FREQ:
-                ui->UpdateKnobValue(ui->hpfFreqKnob, value, ui->hpfFreqValueText, "Hz");
-                break;
-            case GLA2A_CONTROL_SIDECHAIN_HPF_Q:
-                ui->UpdateKnobValue(ui->hpfQKnob, value, ui->hpfQValueText, "");
-                break;
-            case GLA2A_CONTROL_SIDECHAIN_LPF_FREQ:
-                ui->UpdateKnobValue(ui->lpfFreqKnob, value, ui->lpfFreqValueText, "Hz");
-                break;
-            case GLA2A_CONTROL_SIDECHAIN_LPF_Q:
-                ui->UpdateKnobValue(ui->lpfQKnob, value, ui->lpfQValueText, "");
-                break;
-            case GLA2A_PEAK_IN_L: // Aggiornamento VU Meter I/O (Input)
-                if (ui->ioVUMeterShowsInput) {
-                     ui->ioVUMeter->SetMeterValue(value);
-                }
-                break;
-            case GLA2A_PEAK_OUT_L: // Aggiornamento VU Meter I/O (Output)
-                if (!ui->ioVUMeterShowsInput) {
-                     ui->ioVUMeter->SetMeterValue(value);
-                }
-                break;
-            case GLA2A_PEAK_GR: // Aggiornamento VU Meter Gain Reduction (se ripristinato)
-                // Se hai solo un VU Meter I/O, questa linea sarà commentata o rimossa.
-                // ui->grVUMeter->SetMeterValue(value);
-                break;
-            default:
-                break;
-        }
-    } else if (format == ui->atom_Int) {
-        int value = *(const int*)buffer;
-        ui->port_values[port_index] = (float)value;
 
-        switch ((PortIndex)port_index) {
-            case GLA2A_CONTROL_INPUT_ATTENUATOR:
-                // Aggiorna l'aspetto del pulsante "-10dB PAD"
-                if (value == 1) {
-                    ui->inputAttenuatorButton->SetBackgroundColour(*wxRED);
-                } else {
-                    ui->inputAttenuatorButton->SetBackgroundColour(wxNullColour);
-                }
-                ui->inputAttenuatorButton->Refresh();
-                break;
-            case GLA2A_CONTROL_RATIO_SELECT:
-                ui->UpdateKnobValue(ui->ratioKnob, (float)value, ui->ratioValueText);
-                break;
-            case GLA2A_CONTROL_AR_PRESET:
-                ui->UpdateKnobValue(ui->arPresetKnob, (float)value, ui->arPresetValueText);
-                break;
-            case GLA2A_CONTROL_SIDECHAIN_MODE:
-                ui->UpdateSwitchValue(ui->sidechainSourceSwitch, value);
-                break;
-            case GLA2A_CONTROL_SIDECHAIN_MONITOR_MODE:
-                ui->UpdateSwitchValue(ui->sidechainMonitorToggle, value);
-                break;
-            case GLA2A_CONTROL_OVERSAMPLING_MODE:
-                ui->UpdateSwitchValue(ui->oversamplingSwitch, value);
-                break;
-            default:
-                break;
-        }
+    if (ui->glx_context) {
+        glXMakeCurrent(ui->display, None, NULL);
+        glXDestroyContext(ui->display, ui->glx_context);
     }
+    free(ui);
 }
 
-static int idle(LV2_UI_Handle handle) {
-    Gla2aUI* ui = (Gla2aUI*)handle;
-    if (wxTheApp) {
-        wxTheApp->Yield(true);
+// Funzione di gestione degli eventi X11 per ImGui
+// QUESTA È LA PARTE PIÙ CRITICA: un host LV2 DEVE inoltrare gli eventi.
+// Questa implementazione assume un polling manuale degli eventi se l'host non li inoltra.
+// Una vera implementazione LV2 dovrebbe usare LV2_UI__X11_Widget_Event se supportato.
+static int handle_xevent(Gla2aUI* ui, XEvent* event) {
+    ImGuiIO& io = ImGui::GetIO();
+
+    switch (event->type) {
+        case MotionNotify:
+            io.AddMousePosEvent((float)event->xmotion.x, (float)event->xmotion.y);
+            break;
+        case ButtonPress:
+        case ButtonRelease:
+            if (event->xbutton.button >= 1 && event->xbutton.button <= 5) {
+                io.AddMouseButtonEvent(event->xbutton.button - 1, event->xbutton.type == ButtonPress);
+            }
+            break;
+        case KeyPress:
+        case KeyRelease:
+            // Una mappatura Keysym a ImGuiKey è necessaria per gestire tutti i tasti.
+            // Per brevità, gestiamo solo i modificatori e alcuni tasti di base.
+            io.AddKeyEvent(ImGuiMod_Ctrl, event->xkey.state & ControlMask);
+            io.AddKeyEvent(ImGuiMod_Shift, event->xkey.state & ShiftMask);
+            io.AddKeyEvent(ImGuiMod_Alt, event->xkey.state & Mod1Mask);
+            io.AddKeyEvent(ImGuiMod_Super, event->xkey.state & Mod4Mask); // Super/Windows key
+
+            KeySym key_sym = XLookupKeysym(&event->xkey, 0);
+            // Esempio di mappatura di un tasto specifico (A)
+            if (key_sym == XK_A) {
+                io.AddKeyEvent(ImGuiKey_A, event->xkey.type == KeyPress);
+            }
+            // Altri tasti...
+            // io.AddKeyEvent(ImGuiKey_Space, key_sym == XK_space);
+            // io.AddKeyEvent(ImGuiKey_Enter, key_sym == XK_Return);
+            break;
+        case ConfigureNotify: // Finestra ridimensionata
+            // Aggiorna la dimensione del display in ImGui
+            io.DisplaySize = ImVec2((float)event->xconfigure.width, (float)event->xconfigure.height);
+            break;
+        default:
+            return 0; // Evento non gestito
     }
+    return 1; // Evento gestito (o parzialmente gestito)
+}
+
+static void draw_ui(Gla2aUI* ui) {
+    if (!ui->imgui_initialized) return;
+
+    glXMakeCurrent(ui->display, ui->window, ui->glx_context);
+
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Aggiorna il tempo e la dimensione del display prima di iniziare un nuovo frame
+    io.DeltaTime = (float)(get_time_in_seconds() - io.CurrentCaptureLifetime);
+    io.CurrentCaptureLifetime = get_time_in_seconds();
+
+    // Gestisci gli eventi X11 in coda (polling). Questa è una soluzione di ripiego.
+    // L'host dovrebbe idealmente inoltrare gli eventi tramite LV2_UI__X11_Widget_Event.
+    XEvent event;
+    while (XPending(ui->display)) {
+        XNextEvent(ui->display, &event);
+        if (event.xany.window == ui->window) {
+            handle_xevent(ui, &event);
+        }
+    }
+
+    // Inizia un nuovo frame ImGui
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+
+    // Ottieni le dimensioni della finestra per il layout
+    XWindowAttributes wa;
+    XGetWindowAttributes(ui->display, ui->window, &wa);
+    float window_width = (float)wa.width;
+    float window_height = (float)wa.height;
+
+    // Imposta la finestra principale di ImGui (che copre l'intera UI)
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2(window_width, window_height));
+    ImGui::Begin("Gla2a Compressor", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground);
+
+    // =====================================================================
+    // Layout della UI con Tabs
+    // =====================================================================
+    if (ImGui::BeginTabBar("MyTabs"))
+    {
+        // --- Tab Principale ---
+        if (ImGui::BeginTabItem("Main"))
+        {
+            ImGui::Columns(2, "MainLayout", false);
+            ImGui::SetColumnWidth(0, window_width * 0.6f);
+            ImGui::Text("Main Controls");
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2(0, 10)); // Spazio
+
+            ImVec2 knob_img_size = ImVec2((float)ui->knobFrameWidth, (float)ui->knobFrameWidth); // Assumi knob quadrati
+
+            // Knob per Peak Reduction
+            ImGui::PushID("PeakReduction");
+            if (KnobRotaryImage("Peak Reduction", &ui->peakReduction_val, -60.0f, -10.0f,
+                                ui->knobTextureID_peakReduction, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size, "%.1f dB")) {
+                ui->write_function(ui->controller, peakReduction_URID, sizeof(float), 0, &ui->peakReduction_val);
+            }
+            ImGui::PopID();
+            ImGui::SameLine(0, 20); // Spazio tra i knob
+
+            // Knob per Gain Out
+            ImGui::PushID("Gain");
+            if (KnobRotaryImage("Gain Out", &ui->gain_val, 0.0f, 12.0f,
+                                ui->knobTextureID_gain, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size, "%.1f dB")) {
+                ui->write_function(ui->controller, gain_URID, sizeof(float), 0, &ui->gain_val);
+            }
+            ImGui::PopID();
+
+            ImGui::Dummy(ImVec2(0, 20)); // Spazio
+
+            // Toggle Button (Levette) per Input Pad
+            ImGui::Text("Input Pad -10dB");
+            ImGui::SameLine();
+            ImGui::PushID("InputPad");
+            ImTextureID toggle_tex_id = ui->inputPad10dB_val ? (ImTextureID)(intptr_t)ui->toggleSwitchTextureID_on : (ImTextureID)(intptr_t)ui->toggleSwitchTextureID_off;
+            if (ImGui::ImageButton("##InputPadBtn", toggle_tex_id, ImVec2((float)ui->toggleSwitchWidth, (float)ui->toggleSwitchHeight))) {
+                ui->inputPad10dB_val = !ui->inputPad10dB_val;
+                float val = ui->inputPad10dB_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, inputPad10dB_URID, sizeof(float), 0, &val);
+            }
+            ImGui::PopID();
+
+            // Toggle Button per Ratio Mode
+            ImGui::Text("Ratio Mode");
+            ImGui::SameLine();
+            ImGui::PushID("RatioMode");
+            toggle_tex_id = ui->ratioMode_val ? (ImTextureID)(intptr_t)ui->toggleSwitchTextureID_on : (ImTextureID)(intptr_t)ui->toggleSwitchTextureID_off;
+            if (ImGui::ImageButton("##RatioModeBtn", toggle_tex_id, ImVec2((float)ui->toggleSwitchWidth, (float)ui->toggleSwitchHeight))) {
+                ui->ratioMode_val = !ui->ratioMode_val;
+                float val = ui->ratioMode_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, ratioMode_URID, sizeof(float), 0, &val);
+            }
+            ImGui::SameLine(); ImGui::Text(ui->ratioMode_val ? "(Limit)" : "(Comp)");
+            ImGui::PopID();
+
+            ImGui::Dummy(ImVec2(0, 20)); // Spazio
+
+            // Knob per Valve Drive
+            ImGui::PushID("ValveDrive");
+            if (KnobRotaryImage("Valve Drive", &ui->valveDrive_val, 0.0f, 1.0f,
+                                ui->knobTextureID_valveDrive, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size, "%.2f")) {
+                ui->write_function(ui->controller, valveDrive_URID, sizeof(float), 0, &ui->valveDrive_val);
+            }
+            ImGui::PopID();
+
+            ImGui::Dummy(ImVec2(0, 20)); // Spazio
+
+            // Pulsante normale per Bypass
+            ImGui::PushID("Bypass");
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetColumnWidth(0) - ImGui::CalcTextSize("Bypass").x - ImGui::CalcTextSize("OFF").x - ImGui::GetStyle().ItemSpacing.x * 2 - ImGui::GetStyle().FramePadding.x * 2) / 2); // Centra il pulsante
+            if (ImGui::Button(ui->bypass_val ? "BYPASS ON" : "BYPASS OFF", ImVec2(100, 30))) {
+                ui->bypass_val = !ui->bypass_val;
+                float val = ui->bypass_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, bypass_URID, sizeof(float), 0, &val);
+            }
+            ImGui::PopID();
+
+
+            ImGui::NextColumn(); // Passa alla seconda colonna (Meters)
+
+            // Colonna 2: Meter e I/O
+            ImGui::SetColumnWidth(1, window_width * 0.4f);
+            ImGui::Text("Meters");
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2(0, 10)); // Spazio
+
+            // VU Meter di Gain Reduction
+            ImGui::Text("Gain Reduction (dB)");
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Rosso per GR
+            // Normalizza il valore GR da dB a 0.0-1.0 per la progress bar
+            // Assumi che il plugin invii GR in dB (es. 0 a -30), converti per la barra (0.0 a 1.0)
+            float normalized_gr = 1.0f - ImClamp(ui->peakGR_val / -30.0f, 0.0f, 1.0f); // 0dB = 0, -30dB = 1
+            ImGui::ProgressBar(normalized_gr, ImVec2(window_width * 0.35f, 100), ""); // Altezza fissa per meter
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0, 20)); // Spazio
+
+
+            // Switch I/O per il meter principale (testo e checkbox standard)
+            ImGui::Text("Show Output Meter");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("##ShowOutputMeter", &ui->showOutputMeter)) {
+                // Non c'è un parametro LV2 per questo, è solo un toggle della UI
+            }
+            ImGui::SameLine(); ImGui::Text(ui->showOutputMeter ? "(Output)" : "(Input)");
+
+            // VU Meter I/O principale (Input L/R o Output L/R)
+            ImGui::Text("Input/Output Peak (dB)");
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 0.8f, 0.0f, 1.0f)); // Verde
+            float currentIOMeterValL = ui->showOutputMeter ? ui->peakOutL_val : ui->peakInL_val;
+            float currentIOMeterValR = ui->showOutputMeter ? ui->peakOutR_val : ui->peakInR_val;
+            // Converti dB a 0.0-1.0 (es. -60dB a 0dB)
+            float normalized_in_out_L = ImClamp((currentIOMeterValL + 60.0f) / 60.0f, 0.0f, 1.0f);
+            float normalized_in_out_R = ImClamp((currentIOMeterValR + 60.0f) / 60.0f, 0.0f, 1.0f);
+
+            ImGui::ProgressBar(normalized_in_out_L, ImVec2(window_width * 0.35f, 50), "L"); // "L" come overlay testuale
+            ImGui::ProgressBar(normalized_in_out_R, ImVec2(window_width * 0.35f, 50), "R"); // "R" come overlay testuale
+            ImGui::PopStyleColor();
+
+
+            ImGui::Columns(1); // Torna a una singola colonna
+            ImGui::EndTabItem();
+        }
+
+        // --- Tab Sidechain ---
+        if (ImGui::BeginTabItem("Sidechain"))
+        {
+            ImGui::Text("Sidechain Controls");
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2(0, 10)); // Spazio
+
+            ImVec2 knob_img_size_small = ImVec2((float)ui->knobFrameWidth * 0.7f, (float)ui->knobFrameWidth * 0.7f); // Knob più piccoli
+
+            // Oversampling
+            if (ImGui::Checkbox("Oversampling On", &ui->oversamplingOn_val)) {
+                float val = ui->oversamplingOn_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, oversamplingOn_URID, sizeof(float), 0, &val);
+            }
+
+            // Sidechain Mode
+            if (ImGui::Checkbox("External Sidechain", &ui->sidechainMode_val)) {
+                float val = ui->sidechainMode_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, sidechainMode_URID, sizeof(float), 0, &val);
+            }
+
+            ImGui::Dummy(ImVec2(0, 20)); // Spazio
+
+            // Filtri Sidechain (HP/LP)
+            ImGui::Columns(2, "SidechainFilters", false);
+
+            ImGui::Text("HP Filter");
+            if (ImGui::Checkbox("HP On", &ui->scHpOn_val)) {
+                float val = ui->scHpOn_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, scHpOn_URID, sizeof(float), 0, &val);
+            }
+            ImGui::PushID("HpFreq");
+            if (KnobRotaryImage("Freq", &ui->scHpFq_val, 20.0f, 20000.0f,
+                                ui->knobTextureID_scHpFq, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size_small, "%.0f Hz")) {
+                ui->write_function(ui->controller, scHpFq_URID, sizeof(float), 0, &ui->scHpFq_val);
+            }
+            ImGui::PopID();
+            ImGui::PushID("HpQ");
+            if (KnobRotaryImage("Q", &ui->scHpQ_val, 0.1f, 10.0f,
+                                ui->knobTextureID_scHpQ, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size_small, "%.2f")) {
+                ui->write_function(ui->controller, scHpQ_URID, sizeof(float), 0, &ui->scHpQ_val);
+            }
+            ImGui::PopID();
+
+            ImGui::NextColumn();
+
+            ImGui::Text("LP Filter");
+            if (ImGui::Checkbox("LP On", &ui->scLpOn_val)) {
+                float val = ui->scLpOn_val ? 1.0f : 0.0f;
+                ui->write_function(ui->controller, scLpOn_URID, sizeof(float), 0, &val);
+            }
+            ImGui::PushID("LpFreq");
+            if (KnobRotaryImage("Freq", &ui->scLpFq_val, 20.0f, 20000.0f,
+                                ui->knobTextureID_scLpFq, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size_small, "%.0f Hz")) {
+                ui->write_function(ui->controller, scLpFq_URID, sizeof(float), 0, &ui->scLpFq_val);
+            }
+            ImGui::PopID();
+            ImGui::PushID("LpQ");
+            if (KnobRotaryImage("Q", &ui->scLpQ_val, 0.1f, 10.0f,
+                                ui->knobTextureID_scLpQ, ui->knobFrameWidth, ui->knobFrameWidth,
+                                ui->knobTotalFrames, knob_img_size_small, "%.2f")) {
+                ui->write_function(ui->controller, scLpQ_URID, sizeof(float), 0, &ui->scLpQ_val);
+            }
+            ImGui::PopID();
+
+
+            ImGui::Columns(1);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End(); // Fine della finestra principale di ImGui
+
+    // Rendering ImGui
+    ImGui::Render();
+    glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+    glClearColor(0.2f, 0.2f, 0.2f, 1.0f); // Sfondo grigio scuro
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // Se usi viewports multipli (per finestre popup o docking)
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+    {
+        ImGui::UpdatePlatformWindows();
+        ImGui::RenderPlatformWindowsDefault();
+    }
+
+    glXSwapBuffers(ui->display, ui->window); // Swap del buffer per mostrare il frame
+}
+
+static void port_event(LV2_UI_Handle handle, LV2_URID port_urid, uint32_t buffer_size, uint32_t format, const void* buffer) {
+    Gla2aUI* ui = (Gla2aUI*)handle;
+
+    // Se stai usando LV2_Atom, qui dovresti deserializzare gli atom.
+    // Per ora, assumiamo che i float vengano inviati direttamente per i parametri e i meter.
+    if (format == 0) { // LV2_Atom_Port_Float (formato predefinito per float in LV2 UI)
+        // Aggiorna lo stato locale della UI quando il plugin invia un aggiornamento
+        if (port_urid == peakReduction_URID) {
+            ui->peakReduction_val = *(const float*)buffer;
+        } else if (port_urid == gain_URID) {
+            ui->gain_val = *(const float*)buffer;
+        } else if (port_urid == bypass_URID) {
+            ui->bypass_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == ratioMode_URID) {
+            ui->ratioMode_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == valveDrive_URID) {
+            ui->valveDrive_val = *(const float*)buffer;
+        } else if (port_urid == inputPad10dB_URID) {
+            ui->inputPad10dB_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == oversamplingOn_URID) {
+            ui->oversamplingOn_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == sidechainMode_URID) {
+            ui->sidechainMode_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == scLpOn_URID) {
+            ui->scLpOn_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == scLpFq_URID) {
+            ui->scLpFq_val = *(const float*)buffer;
+        } else if (port_urid == scLpQ_URID) {
+            ui->scLpQ_val = *(const float*)buffer;
+        } else if (port_urid == scHpOn_URID) {
+            ui->scHpOn_val = (*(const float*)buffer != 0.0f);
+        } else if (port_urid == scHpFq_URID) {
+            ui->scHpFq_val = *(const float*)buffer;
+        } else if (port_urid == scHpQ_URID) {
+            ui->scHpQ_val = *(const float*)buffer;
+        }
+        // Aggiorna i valori dei meter (il plugin dovrebbe inviarli regolarmente)
+        else if (port_urid == peakGR_URID) {
+            ui->peakGR_val = *(const float*)buffer;
+        } else if (port_urid == peakInL_URID) {
+            ui->peakInL_val = *(const float*)buffer;
+        } else if (port_urid == peakInR_URID) {
+            ui->peakInR_val = *(const float*)buffer;
+        } else if (port_urid == peakOutL_URID) {
+            ui->peakOutL_val = *(const float*)buffer;
+        } else if (port_urid == peakOutR_URID) {
+            ui->peakOutR_val = *(const float*)buffer;
+        }
+    }
+    // Richiede un ridisegno della UI dopo ogni aggiornamento del parametro
+    draw_ui(ui);
+}
+
+
+static int ui_extension_data(const char* uri) {
+    if (!strcmp(uri, LV2_UI__idleInterface)) {
+        return 0; // Supporta l'interfaccia idle
+    }
+    // Se supporti l'inoltro diretto degli eventi X11 da parte dell'host, lo dichiereresti qui:
+    // if (!strcmp(uri, LV2_UI__X11_Widget_Event)) {
+    //     return 0;
+    // }
     return 0;
 }
 
-static void cleanup(LV2_UI_Handle handle) {
+static void ui_idle(LV2_UI_Handle handle) {
     Gla2aUI* ui = (Gla2aUI*)handle;
-    if (ui) {
-        if (ui->frame) {
-            ui->frame->Destroy();
-        }
-        wxUninitialize();
-        free(ui);
-    }
+    draw_ui(ui); // Ridisegna la UI in modalità idle
 }
 
-static const void* extension_data(const char* uri) {
+static const LV2_UI_Idle_Interface idle_iface = { ui_idle };
+
+// Funzione per LV2_UI__X11_Widget_Event (se l'host la supporta)
+// Non implementata qui per semplicità, se la tua DAW la supporta, è da preferire.
+// static int ui_x11_event(LV2_UI_Handle handle, XEvent* event) {
+//    Gla2aUI* ui = (Gla2aUI*)handle;
+//    return handle_xevent(ui, event); // Passa l'evento all'handler di ImGui
+// }
+// static const LV2_UI_X11_Widget_Event_Interface x11_event_iface = { ui_x11_event };
+
+
+static const void* ui_extension_data_interface(const char* uri) {
     if (!strcmp(uri, LV2_UI__idleInterface)) {
-        static LV2_UI_Idle_Interface idle_iface = { idle };
         return &idle_iface;
     }
+    // if (!strcmp(uri, LV2_UI__X11_Widget_Event)) {
+    //     return &x11_event_iface;
+    // }
     return NULL;
 }
 
-static const LV2_UI_Descriptor gla2aUiDescriptor = {
-    GLA2A_GUI_URI,
-    instantiate,
-    cleanup,
-    port_event,
-    extension_data
+
+// =========================================================================
+// Descrittori della UI
+// =========================================================================
+static const LV2_UI_Descriptor descriptors[] = {
+    {
+        "http://your-plugin.com/gla2a-ui", // URI della UI (DEVE ESSERE DIVERSO dal plugin audio)
+        instantiate,
+        cleanup,
+        port_event,
+        ui_extension_data_interface // Puntatore alla funzione di estensione
+    }
 };
 
-LV2_SYMBOL_EXPORT
-const LV2_UI_Descriptor* lv2ui_descriptor(uint32_t index) {
-    switch (index) {
-        case 0:
-            return &gla2aUiDescriptor;
-        default:
-            return NULL;
-    }
+const LV2_UI_Descriptor* lv2_ui_descriptor(uint32_t index) {
+    if (index == 0) return &descriptors[0];
+    return NULL;
 }
-
-class MyApp : public wxApp {
-public:
-    virtual bool OnInit() {
-        return true;
-    }
-    virtual int OnExit() {
-        return 0;
-    }
-};
-
-IMPLEMENT_APP_NO_MAIN(MyApp);
