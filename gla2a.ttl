@@ -1,211 +1,129 @@
-@prefix doap:  <http://usefulinc.com/ns/doap#> .
-@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
-@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix foaf:  <http://xmlns.com/foaf/0.1/> .
-@prefix units: <http://lv2plug.in/ns/extensions/units#> .
-@prefix pprops: <http://lv2plug.in/ns/ext/port-props#> .
-@prefix urid: <http://lv2plug.in/ns/ext/urid#> .
+@prefix lv2:  <http://lv2plug.in/ns/lv2core#> .
+@prefix ui:   <http://lv2plug.in/ns/extensions/ui#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix pset: <http://lv2plug.in/ns/ext/presets#> .
 @prefix atom: <http://lv2plug.in/ns/ext/atom#> .
+@prefix urid: <http://lv2plug.in/ns/ext/urid#> .
 @prefix midi: <http://lv2plug.in/ns/ext/midi#> .
-@prefix pg: <http://lv2plug.in/ns/ext/port-groups#> .
+@prefix doap: <http://usefulinc.com/ns/doap#> .
+@prefix units: <http://lv2plug.in/ns/extensions/units#> .
 
-<http://gregorioferraris.github.io/lv2/gla2a>
+<http://moddevices.com/plugins/mod-devel/gla2a>
     a lv2:Plugin ;
-    lv2:optionalFeature urid:map ; # Necessario per alcune funzionalità come la mappatura URID
-    doap:name "Gla2a Compressor" ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    doap:name "GLA2A Leveling Amplifier" ;
     doap:maintainer [
-        foaf:name "Gregorio Ferraris" ;
-        foaf:homepage <https://github.com/gregorioferraris> ;
-        foaf:mbox <mailto:tuo.email@example.com> # Sostituisci con la tua email
+        doap:name "Your Name" ;
+        doap:mbox <mailto:your.email@example.com> ;
     ] ;
-    lv2:project <http://gregorioferraris.github.io/lv2/gla2a> ;
-    doap:license <http://opensource.org/licenses/ISC> ; # Esempio di licenza, scegli la tua
+    doap:homepage <http://yourwebsite.com> ;
+    doap:license <http://opensource.org/licenses/MIT> ;
 
     lv2:port [
-        a lv2:ControlPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:ControlPort ;
         lv2:index 0 ;
-        lv2:name "Input Gain" ;
-        lv2:symbol "gain_in" ;
-        lv2:default 0.0 ;
-        lv2:minimum -20.0 ;
-        lv2:maximum 20.0 ;
-        units:unit units:db ;
-        rdfs:comment "Adjusts the input gain before compression."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 1 ;
-        lv2:name "Output Gain" ;
-        lv2:symbol "gain_out" ;
-        lv2:default 0.0 ;
-        lv2:minimum -20.0 ;
-        lv2:maximum 20.0 ;
-        units:unit units:db ;
-        rdfs:comment "Adjusts the output make-up gain after compression."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 2 ;
-        lv2:name "Peak Reduction" ;
         lv2:symbol "peak_reduction" ;
-        lv2:default 50.0 ;
+        lv2:name "Peak Reduction" ;
+        lv2:default 0.0 ;
         lv2:minimum 0.0 ;
-        lv2:maximum 100.0 ;
-        units:unit units:percent ;
-        rdfs:comment "Controls the amount of gain reduction applied."
+        lv2:maximum 1.0 ;
     ] , [
-        a lv2:ControlPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 1 ;
+        lv2:symbol "gain" ;
+        lv2:name "Gain" ;
+        lv2:default 0.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 2 ;
+        lv2:symbol "meter" ;
+        lv2:name "Meter" ;
+        lv2:default 0.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+        lv2:portProperty lv2:enumeration ;
+        lv2:scalePoint [ rdfs:label "Gain Reduction" ; lv2:value 0.0 ] ,
+                       [ rdfs:label "Output" ; lv2:value 1.0 ] ;
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
         lv2:index 3 ;
-        lv2:name "Mode" ;
-        lv2:symbol "mode" ;
+        lv2:symbol "limiter" ;
+        lv2:name "Limit" ;
         lv2:default 0.0 ;
         lv2:minimum 0.0 ;
         lv2:maximum 1.0 ;
-        lv2:portProperty lv2:integer ;
-        lv2:scalePoint [ rdfs:label "Compress" ; lv2:value 0.0 ] ;
-        lv2:scalePoint [ rdfs:label "Limit" ; lv2:value 1.0 ] ;
-        rdfs:comment "Switches between Compressor and Limiter modes."
+        lv2:portProperty lv2:enumeration ;
+        lv2:scalePoint [ rdfs:label "Compress" ; lv2:value 0.0 ] ,
+                       [ rdfs:label "Limit" ; lv2:value 1.0 ] ;
     ] , [
-        a lv2:ControlPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:ControlPort ;
         lv2:index 4 ;
-        lv2:name "Sidechain Source" ;
-        lv2:symbol "sidechain_mode" ;
-        lv2:default 0.0 ;
+        lv2:symbol "hi_freq" ;
+        lv2:name "Hi Freq" ;
+        lv2:default 1.0 ;
         lv2:minimum 0.0 ;
         lv2:maximum 1.0 ;
-        lv2:portProperty lv2:integer ;
-        lv2:scalePoint [ rdfs:label "Internal" ; lv2:value 0.0 ] ;
-        lv2:scalePoint [ rdfs:label "External" ; lv2:value 1.0 ] ;
-        rdfs:comment "Selects internal or external sidechain input."
+        lv2:portProperty lv2:enumeration ;
+        lv2:scalePoint [ rdfs:label "Flat" ; lv2:value 0.0 ] ,
+                       [ rdfs:label "HF Comp" ; lv2:value 1.0 ] ;
     ] , [
-        a lv2:AudioPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:ControlPort ;
         lv2:index 5 ;
-        lv2:name "External Sidechain In" ;
-        lv2:symbol "ext_sidechain_in" ;
-        lv2:connectionOptional true ; # Questo è un port opzionale
-        rdfs:comment "Optional external audio input for sidechain detection."
+        lv2:symbol "output_rms" ;
+        lv2:name "Output RMS" ;
+        lv2:designation units:db ;
+        lv2:default -60.0 ;
+        lv2:minimum -90.0 ;
+        lv2:maximum 0.0 ;
+        lv2:portProperty lv2:notOnGUI ; # Questo è un output per la GUI o per monitoraggio, non per un controllo diretto
     ] , [
-        a lv2:ControlPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:ControlPort ;
         lv2:index 6 ;
-        lv2:name "Ratio" ;
-        lv2:symbol "ratio_select" ;
-        lv2:default 1.0 ; # Corrisponde a 4:1
-        lv2:minimum 0.0 ;
-        lv2:maximum 2.0 ;
-        lv2:portProperty lv2:integer ;
-        lv2:scalePoint [ rdfs:label "2:1" ; lv2:value 0.0 ] ;
-        lv2:scalePoint [ rdfs:label "4:1" ; lv2:value 1.0 ] ;
-        lv2:scalePoint [ rdfs:label "8:1" ; lv2:value 2.0 ] ;
-        rdfs:comment "Selects the compression ratio for Compressor mode."
+        lv2:symbol "gain_reduction_meter" ;
+        lv2:name "Gain Reduction Meter" ;
+        lv2:designation units:db ;
+        lv2:default 0.0 ;
+        lv2:minimum -30.0 ;
+        lv2:maximum 0.0 ;
+        lv2:portProperty lv2:notOnGUI ; # Questo è un output per la GUI o per monitoraggio, non per un controllo diretto
     ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 7 ;
-        lv2:name "AR Preset" ;
-        lv2:symbol "ar_preset" ;
-        lv2:default 1.0 ; # Corrisponde a Medium
-        lv2:minimum 0.0 ;
-        lv2:maximum 2.0 ;
-        lv2:portProperty lv2:integer ;
-        lv2:scalePoint [ rdfs:label "Fast" ; lv2:value 0.0 ] ;
-        lv2:scalePoint [ rdfs:label "Medium" ; lv2:value 1.0 ] ;
-        lv2:scalePoint [ rdfs:label "Slow" ; lv2:value 2.0 ] ;
-        rdfs:comment "Selects attack and release time presets."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 8 ;
-        lv2:name "Tube Drive" ;
-        lv2:symbol "tube_drive" ;
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 7 ; # NUOVA PORTA
+        lv2:symbol "bypass" ;
+        lv2:name "Bypass" ;
+        lv2:portProperty lv2:toggled ;
         lv2:default 0.0 ;
         lv2:minimum 0.0 ;
         lv2:maximum 1.0 ;
-        rdfs:comment "Controls the amount of tube saturation."
     ] , [
-        a lv2:AudioPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 8 ; # NUOVA PORTA
+        lv2:symbol "ms_mode_active" ;
+        lv2:name "M/S Mode" ;
+        lv2:portProperty lv2:toggled ;
+        lv2:default 0.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+    ] , [
+        a lv2:InputPort , lv2:AudioPort ;
         lv2:index 9 ;
-        lv2:name "Input L" ;
-        lv2:symbol "in_l" ;
-        pg:group pg:mainInput ;
-        rdfs:comment "Left input audio."
+        lv2:symbol "audio_in_L" ;
+        lv2:name "Audio Input L" ;
     ] , [
-        a lv2:AudioPort, lv2:InputPort ;
+        a lv2:InputPort , lv2:AudioPort ;
         lv2:index 10 ;
-        lv2:name "Input R" ;
-        lv2:symbol "in_r" ;
-        pg:group pg:mainInput ;
-        rdfs:comment "Right input audio."
+        lv2:symbol "audio_in_R" ;
+        lv2:name "Audio Input R" ;
     ] , [
-        a lv2:AudioPort, lv2:OutputPort ;
+        a lv2:OutputPort , lv2:AudioPort ;
         lv2:index 11 ;
-        lv2:name "Output L" ;
-        lv2:symbol "out_l" ;
-        pg:group pg:mainOutput ;
-        rdfs:comment "Left output audio."
+        lv2:symbol "audio_out_L" ;
+        lv2:name "Audio Output L" ;
     ] , [
-        a lv2:AudioPort, lv2:OutputPort ;
+        a lv2:OutputPort , lv2:AudioPort ;
         lv2:index 12 ;
-        lv2:name "Output R" ;
-        lv2:symbol "out_r" ;
-        pg:group pg:mainOutput ;
-        rdfs:comment "Right output audio."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 13 ;
-        lv2:name "Oversampling" ;
-        lv2:symbol "oversampling_mode" ;
-        lv2:default 0.0 ;
-        lv2:minimum 0.0 ;
-        lv2:maximum 1.0 ;
-        lv2:portProperty lv2:integer ;
-        lv2:scalePoint [ rdfs:label "Off" ; lv2:value 0.0 ] ;
-        lv2:scalePoint [ rdfs:label "2x" ; lv2:value 1.0 ] ;
-        rdfs:comment "Enables or disables 2x oversampling for improved audio quality."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 14 ;
-        lv2:name "SC HPF Freq" ;
-        lv2:symbol "sidechain_hpf_freq" ;
-        lv2:default 20.0 ;
-        lv2:minimum 20.0 ;
-        lv2:maximum 20000.0 ;
-        units:unit units:hz ;
-        rdfs:comment "High-pass filter frequency for the sidechain signal."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 15 ;
-        lv2:name "SC LPF Freq" ;
-        lv2:symbol "sidechain_lpf_freq" ;
-        lv2:default 20000.0 ;
-        lv2:minimum 20.0 ;
-        lv2:maximum 20000.0 ;
-        units:unit units:hz ;
-        rdfs:comment "Low-pass filter frequency for the sidechain signal."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 16 ;
-        lv2:name "SC Filter Q" ;
-        lv2:symbol "sidechain_filter_q" ;
-        lv2:default 0.707 ;
-        lv2:minimum 0.1 ;
-        lv2:maximum 5.0 ;
-        rdfs:comment "Q factor for the sidechain filters."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 17 ;
-        lv2:name "SC Monitor" ;
-        lv2:symbol "sidechain_monitor_mode" ;
-        lv2:default 0.0 ;
-        lv2:minimum 0.0 ;
-        lv2:maximum 1.0 ;
-        lv2:portProperty lv2:integer ;
-        lv2:scalePoint [ rdfs:label "Off" ; lv2:value 0.0 ] ;
-        lv2:scalePoint [ rdfs:label "On" ; lv2:value 1.0 ] ;
-        rdfs:comment "Monitors the sidechain signal instead of the processed audio."
-    ] , [
-        a lv2:ControlPort, lv2:InputPort ;
-        lv2:index 18 ; # <--- NUOVA PORTA
-        lv2:name "Input Attenuator" ;
-        lv2:symbol "input_attenuator" ;
-        lv2:portProperty lv2:toggled ; # Indica che è un interruttore (0 o 1)
-        lv2:default 0 ;
-        lv2:minimum 0 ;
-        lv2:maximum 1 ;
-        rdfs:comment "Applies a -10dB attenuation to the input signal."
+        lv2:symbol "audio_out_R" ;
+        lv2:name "Audio Output R" ;
     ] .
