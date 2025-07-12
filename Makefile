@@ -1,42 +1,76 @@
-# Definisci il nome del plugin (senza estensione .so)
-PLUGIN_NAME = gla2a
-
-# Trova i flags di compilazione e link dalle librerie LV2
-# pkg-config è fondamentale per trovare le directory di include e le librerie necessarie.
-LV2_CFLAGS := $(shell pkg-config --cflags lv2)
-LV2_LIBS := $(shell pkg-config --libs lv2)
-
-# Il compilatore C++ da usare
+# --- General Project Settings ---
+# Compiler (GCC/G++)
 CXX = g++
+CC = gcc # For C files like glad.c
 
-# Flags di compilazione
-# -fPIC: Necessario per creare librerie condivise
-# -DPIC: Convenzione per indicare che si sta compilando codice indipendente dalla posizione
-# -Wall: Abilita tutti i warning (buona pratica per trovare errori)
-# -O2: Livello di ottimizzazione 2 (buon compromesso tra velocità di compilazione e performance)
-# -g: Include informazioni di debug (utile per risolvere problemi)
-# -std=c++11: Usa lo standard C++11 (o superiore, se preferisci)
-CFLAGS = -fPIC -DPIC -Wall -O2 -g -std=c++11
+# Standard C++ version (Dear ImGui requires C++11 or newer)
+CXXSTANDARD = c++11
+CSTANDARD = c99 # For glad.c
 
-# Flags di link
-# -shared: Crea una libreria condivisa (.so)
-LDFLAGS = -shared
+# List of all plugin bundles in this project
+PLUGIN_BUNDLES = gla2a.lv2 gla3a.lv2 gua76.lv2
 
-# --- Regole di Compilazione ---
+# LV2 Install Path (for `make deploy`)
+LV2_INSTALL_PATH := ~/.lv2
 
-# Regola predefinita: compila il plugin
-all: $(PLUGIN_NAME).so
+# --- Common Compiler Flags ---
+COMMON_CXXFLAGS = -fPIC -Wall -O2 -std=$(CXXSTANDARD)
+COMMON_CFLAGS = -fPIC -Wall -O2 -std=$(CSTANDARD)
 
-# Compilazione del file sorgente .cpp in un oggetto .o
-# $<: Il primo prerequisito (gla2a.cpp)
-# $@: Il target (gla2a.o)
-$(PLUGIN_NAME).o: $(PLUGIN_NAME).cpp
-    $(CXX) $(CFLAGS) $(LV2_CFLAGS) -c $< -o $@
+# Include Paths common to all plugins (e.g., LV2 headers)
+LV2_HEADERS = $(shell pkg-config --cflags lv2)
 
-# Linkaggio dell'oggetto .o nella libreria condivisa .so
-$(PLUGIN_NAME).so: $(PLUGIN_NAME).o
-    $(CXX) $(LDFLAGS) $< -o $@ $(LV2_LIBS) -lm
+# GUI specific includes (ImGui, GLAD, GLFW)
+# These paths are relative to the *individual plugin bundle* directory.
+# We'll prepend $(dir) in the specific rules.
+IMGUI_INC = -Iimgui -Iglad
+GLFW_INC = $(shell pkg-config --cflags glfw3)
 
-# Regola per "pulire" i file generati dalla compilazione
+# All GUI includes
+GUI_INCLUDES = $(LV2_HEADERS) $(IMGUI_INC) $(GLFW_INC)
+
+# Common Linker Flags for shared libraries
+COMMON_LIBS = -shared -lm -ldl -lrt
+
+# GUI specific libraries
+GLFW_LIBS = $(shell pkg-config --libs glfw3) -lGL
+
+# --- Targets ---
+.PHONY: all clean deploy $(PLUGIN_BUNDLES)
+
+# Default target: build all plugins
+all: $(PLUGIN_BUNDLES)
+
+# Rule for building each individual plugin bundle
+$(PLUGIN_BUNDLES):
+	$(MAKE) -C $@ all
+
+# --- Individual Plugin Bundle Rules (Delegated to Sub-Makefiles) ---
+# This Makefile acts as a master. Each plugin bundle will have its own simpler Makefile
+# inside its directory (e.g., gla2a.lv2/Makefile).
+
+# Dummy target to prevent 'make -C' from complaining if no sub-Makefile exists yet
+.PHONY: $(PLUGIN_BUNDLES)
+
+# --- Clean Target ---
 clean:
-    rm -f *.o *.so
+	@echo "Cleaning all plugin bundles..."
+	@for bundle in $(PLUGIN_BUNDLES); do \
+		if [ -d "$$bundle" ]; then \
+			$(MAKE) -C "$$bundle" clean || true; \
+		fi \
+	done
+	@echo "Cleaning complete."
+
+# --- Deploy Target ---
+deploy: all
+	@echo "Deploying all plugin bundles to $(LV2_INSTALL_PATH)..."
+	@mkdir -p $(LV2_INSTALL_PATH)
+	@for bundle in $(PLUGIN_BUNDLES); do \
+		if [ -d "$$bundle" ]; then \
+			cp -r "$$bundle" $(LV2_INSTALL_PATH)/; \
+			echo "Deployed $$bundle"; \
+		fi \
+	done
+	@echo "Deployment complete."
+	@echo "You might need to refresh your DAW's plugin list."
